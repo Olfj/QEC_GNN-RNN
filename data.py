@@ -74,7 +74,7 @@ class Dataset:
         self.circuits = [
             make_surface_code_with_logical_z_tracking(
                 distance=self.distance,
-                rounds=t,
+                rounds=2*t,
                 error_rate=error_rate
             )
             for error_rate, t in combinations
@@ -89,16 +89,20 @@ class Dataset:
         # Precompute and store the physical detector coordinates for each circuit
         # These are used to map detection event indices into real space-time coordinates
         self.detector_coordinates = []
+        n_stabilizers = self.distance ** 2 - 1
+        n_z_stabilizers = n_stabilizers / 2
+        old_t = int(n_stabilizers * self.t[0] - n_z_stabilizers)
         for circuit in self.circuits:
             # Hardcoded to use "rotated_memory_x" regardless of self.code_task
             detector_coordinate = stim.Circuit.generated(
                 code_task="surface_code:rotated_memory_x",  # NOTE: hardcoded
                 distance=self.distance,
-                rounds=self.t[0]
+                rounds=2 * self.t[0]
             ).get_detector_coordinates()
 
             # Convert from dict to array and rescale x, y by 1/2 (Stim convention)
             detector_coordinate = np.array(list(detector_coordinate.values()))
+            detector_coordinate = detector_coordinate[:old_t, :]
             detector_coordinate[:, :2] /= 2
             self.detector_coordinates.append(detector_coordinate.astype(np.int64))
 
@@ -146,11 +150,15 @@ class Dataset:
 
         sampler = self.samplers[sampler_idx]
         detection_events_list, observable_flips_list = [], []
+        n_stabilizers = self.distance ** 2 - 1
+        n_z_stabilizers = n_stabilizers / 2
+        old_t = int(n_stabilizers * self.t[0] - n_z_stabilizers)
         # Sample until we get a batch where each element has at least
         # one detection event. 
         while len(detection_events_list) < self.batch_size: 
             detection_events, observable_flips = sampler.sample(
                 shots=self.batch_size, separate_observables=True)
+            detection_events, observable_flips = detection_events[:,  :old_t], observable_flips[:, :self.t[0]]
             shots_w_flips = np.sum(detection_events, axis=1) != 0 # only include cases where there is at least one detection event.
             detection_events_list.extend(detection_events[shots_w_flips, :])
             observable_flips_list.extend(observable_flips[shots_w_flips, :])
@@ -402,6 +410,8 @@ class Dataset:
 
         Returns:
             aligned_labels: Tensor of shape [B, L], aligned with GRU output
+                            Might look like: [[1, 1, 1],
+                                              [1, 1, 0]]
         """
         B = int(label_map[:, 0].max().item()) + 1
         lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of real chunks per batch
