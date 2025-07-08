@@ -85,11 +85,27 @@ def make_surface_code_with_logical_z_tracking(distance: int, rounds: int, error_
     for r in range(1, rounds - 1):
         new_circuit += patched_repeat_block
         new_circuit += logical_z_measurement_block(r)
-
-    new_circuit += patched_repeat_block
     # no ancilla based measurement of Z_L in last round, take direct measurement of
     # original circuit instead
-    new_circuit += suffix
+    new_circuit += patched_repeat_block
+
+    patched_suffix = stim.Circuit()
+
+    def patch_detector_offsets_suffix(suffix):
+        patched = stim.Circuit()
+        for instr in suffix:
+            if instr.name == "OBSERVABLE_INCLUDE":
+                # Only relabel observable index; keep original rec[] indices
+                targets = instr.targets_copy()
+                rec_targets = " ".join(f"rec[{t.value}]" for t in targets)
+                patched += stim.Circuit(f"OBSERVABLE_INCLUDE({rounds - 1}) {rec_targets}")
+
+            else:
+                patched.append(instr)
+        return patched
+
+    patched_suffix = patch_detector_offsets_suffix(suffix)
+    new_circuit += patched_suffix
 
     return new_circuit
 

@@ -41,7 +41,7 @@ if __name__ == "__main__":
         log_wandb=True
     )
     current_datetime = datetime.now().strftime("%y%m%d_%H%M%S")
-    model_name = 'd' + str(d) + '_t' + str(t) + '_dt' + str(dt) + '_' + current_datetime
+    model_name = 'train_final_t_d' + str(d) + '_t' + str(t) + '_dt' + str(dt) + '_' + current_datetime
 
     decoder = GRUDecoder(args)
     if load_path is not None:
