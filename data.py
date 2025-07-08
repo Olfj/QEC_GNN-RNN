@@ -114,7 +114,6 @@ class Dataset:
         # The final syndrome mask distinguishes X (1) and Z (3) stabilizers
         self.syndrome_mask = syndrome_x + syndrome_z
 
-
     def sample_syndromes(self, sampler_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """
         Samples a batch of detection events and corresponding logical observables
@@ -129,9 +128,7 @@ class Dataset:
             flips_array: an integer array of shape [batch_size, self.t], where
                 - self.t = number of logical observable measurement points
                 Each entry flips_array[b, i] is 1 if a logical bit- or phase-flip
-                has occurred in batch element `b` up to and including chunk `i`,
-                as reported by the corresponding OBSERVABLE_INCLUDE instruction.
-                Otherwise, it is 0.
+                has occurred in batch element `b` at chunk `i`, 0 otherwise
     
         Notes:
             - The circuit used must include intermediate OBSERVABLE_INCLUDE statements
@@ -391,34 +388,53 @@ class Dataset:
 
         return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label
     
-    def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor) -> torch.Tensor:
+    def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
         """
-        Given label_map and full logical flips, return a label tensor aligned
-        with the packed GRU output (i.e., labels only for non-empty chunks, in GRU order).
+        Align labels from full chunk structure to compact GRU outputs.
 
         Args:
-            label_map: Tensor of shape [n_graphs, 2], with (batch_idx, chunk_idx)
-            flips_full: Tensor of shape [B, g], with one label per possible chunk
+            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
+                                Must be sorted by batch_idx (ascending).
+            flips_full (Tensor): shape [B, g], full labels for all possible chunks.
 
         Returns:
-            aligned_labels: Tensor of shape [B, L], aligned with GRU output
+            aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
+            lengths (Tensor): shape [B], number of real chunks per batch element.
+
+        Example:
+            If flips_full = [[a, -, b, c], [d, e, -, f]]
+            and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1], [1,3]]
+            then aligned_flips = [[a, b, c], [d, e, f]]
+            and lengths = [3, 3]
         """
-        B = int(label_map[:, 0].max().item()) + 1
-        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of real chunks per batch
+        
+        B = self.batch_size
+        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
         max_len = lengths.max().item()
 
-        aligned_flips = torch.zeros(B, max_len, device=self.device)
-        offsets = torch.zeros(B, dtype=torch.long, device=self.device)
+        batch_idxs = label_map[:, 0].long()   # [n_valid]
+        chunk_idxs = label_map[:, 1].long()   # [n_valid]
 
-        for i in range(label_map.size(0)):
-            b = int(label_map[i, 0])
-            t = int(label_map[i, 1])
-            pos = offsets[b].item()
-            aligned_flips[b, pos] = flips_full[b, t]
-            offsets[b] += 1
+        # Compute correct relative positions (resets counter per batch)
+        rel_pos = torch.zeros_like(batch_idxs)
+        current_batch = batch_idxs[0].item()
+        counter = 0
+        for i in range(batch_idxs.size(0)):
+            b = batch_idxs[i].item()
+            if b != current_batch:
+                current_batch = b
+                counter = 0
+            rel_pos[i] = counter
+            counter += 1
 
-        return aligned_flips, lengths  # counts = lengths for masking
+        # Gather the labels to fill in
+        values = flips_full[batch_idxs, chunk_idxs]
 
+        # Allocate and fill aligned label tensor
+        aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
+        aligned_flips[batch_idxs, rel_pos] = values
+        
+        return aligned_flips, lengths
 
 
     def plot_graph(self, node_features, edge_index, labels, graph_idx):

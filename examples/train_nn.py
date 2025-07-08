@@ -31,12 +31,12 @@ if __name__ == "__main__":
         t=[t],
         dt=dt,
         sliding=True,
-        train_all_times = False,
+        train_all_times = True,
         batch_size=args_cli.batch_size,
         n_batches=args_cli.n_batches,
         n_epochs=args_cli.n_epochs,
-        embedding_features=[5, 32, 64, 128, 256],
-        hidden_size=128,
+        embedding_features=[5, 32, 64, 128, 256, 512],
+        hidden_size=512,
         n_gru_layers=4,
         log_wandb=True
     )
