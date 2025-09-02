@@ -16,3 +16,14 @@ __pycache__/
 /src/models/
 /stats
 /models
+*.csv
+*.pdf
+*.b8
+*.stim
+*.json
+*.png
+*.md
+*.dem
+*.svg
+*.01
+*.yml

@@ -171,7 +171,7 @@ class GRUDecoder(nn.Module):
         self.eval()
         accuracy_list = torch.zeros(n_iter)
         data_time, model_time = 0, 0
-        for i in tqdm(range(n_iter), disable=not verbose):
+        for i in tqdm(range(n_iter), disable=verbose):
             t0 = time.perf_counter()
             x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label = dataset.generate_batch()
             t1 = time.perf_counter() 
