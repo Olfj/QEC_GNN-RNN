@@ -73,7 +73,7 @@ class GRUDecoder(nn.Module):
         best_model = self.state_dict()
 
         if self.args.log_wandb:
-            wandb.init(project="GNN-RNN-surface_code", name = save, config = self.args)
+            wandb.init(project="GNN-RNN-google", name = save, config = self.args)
 
         if local_log:
             logger.on_training_begin(self.args)
@@ -98,7 +98,7 @@ class GRUDecoder(nn.Module):
                 optim.zero_grad()
     
                 t0 = time.perf_counter() 
-                x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label = dataset.generate_batch()
+                x, edge_index, batch_labels, label_map, edge_attr, last_label = dataset.generate_batch()
 
                 t1 = time.perf_counter()
                 # Forward pass through the model
@@ -107,23 +107,22 @@ class GRUDecoder(nn.Module):
                 #   g_actual = maximum number of non-empty chunks in batch
                 # (can vary between batches, <= t - dt + 2)
                 out, final_prediction = self.forward(x, edge_index, edge_attr, batch_labels, label_map)
-                if self.args.train_all_times:
-                    # Create a boolean mask of shape [B, g_actual] indicating valid chunk positions
-                    # For each batch element b, mask[b, i] = True if i < lengths[b]
-                    # lengths[b] is the number of non-empty chunks for batch element b
-                    mask = torch.arange(out.size(1), device=out.device)[None, :] < lengths[:, None]
+                # if self.args.train_all_times:
+                #     # Create a boolean mask of shape [B, g_actual] indicating valid chunk positions
+                #     # For each batch element b, mask[b, i] = True if i < lengths[b]
+                #     # lengths[b] is the number of non-empty chunks for batch element b
+                #     mask = torch.arange(out.size(1), device=out.device)[None, :] < lengths[:, None]
 
-                    # Compute binary cross-entropy loss for each element without reduction
-                    # loss_raw has shape [B, g_actual], matching the shape of out and aligned_flips
-                    loss_raw = nn.functional.binary_cross_entropy(out, aligned_flips, reduction='none')
+                #     # Compute binary cross-entropy loss for each element without reduction
+                #     # loss_raw has shape [B, g_actual], matching the shape of out and aligned_flips
+                #     loss_raw = nn.functional.binary_cross_entropy(out, aligned_flips, reduction='none')
 
-                    # Apply the mask to zero out the loss from padded (non-existent) chunks
-                    # Then compute the mean loss over all valid elements
-                    loss = (loss_raw * mask).sum() / mask.sum()
-                else:
-                    # If not training all times, we only consider the final label
-                    loss = nn.functional.binary_cross_entropy(final_prediction, last_label)
+                #     # Apply the mask to zero out the loss from padded (non-existent) chunks
+                #     # Then compute the mean loss over all valid elements
+                #     loss = (loss_raw * mask).sum() / mask.sum()
 
+                # If not training all times, we only consider the final label
+                loss = nn.functional.binary_cross_entropy(final_prediction, last_label)
                 # Backpropagation and optimization step
                 loss.backward()
                 optim.step()

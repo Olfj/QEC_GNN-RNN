@@ -71,14 +71,17 @@ class Dataset:
         combinations = itertools.product(self.error_rates, self.t)
 
         # Build one circuit per combination, with intermediate logical observables inserted
-        self.circuits = [
-            make_surface_code_with_logical_z_tracking(
-                distance=self.distance,
-                rounds=t,
-                error_rate=error_rate
-            )
-            for error_rate, t in combinations
-        ]
+        if self.distance == 3:
+            path_ending = 'd3_q2_7_X_r50_p_0_005'
+        elif self.distance == 5:
+            path_ending = 'd5_q4_7_X_r50_p_0_005'
+        elif self.distance == 7:
+            path_ending = 'd7_q6_7_X_r50_p_0_005'
+        else:
+            print('Please enter valid code distance.')
+        
+        path = "/Users/xlmori/Desktop/QEC_GNN-RNN/circuits_ZXXZ/" + path_ending + '.stim'
+        self.circuits = [stim.Circuit.from_file(path)]
 
         # Compile each circuit into a Stim detector sampler for fast sampling
         self.samplers = [
@@ -90,29 +93,10 @@ class Dataset:
         # These are used to map detection event indices into real space-time coordinates
         self.detector_coordinates = []
         for circuit in self.circuits:
-            # Hardcoded to use "rotated_memory_x" regardless of self.code_task
-            detector_coordinate = stim.Circuit.generated(
-                code_task="surface_code:rotated_memory_x",  # NOTE: hardcoded
-                distance=self.distance,
-                rounds=self.t[0]
-            ).get_detector_coordinates()
-
-            # Convert from dict to array and rescale x, y by 1/2 (Stim convention)
-            detector_coordinate = np.array(list(detector_coordinate.values()))
-            detector_coordinate[:, :2] /= 2
-            self.detector_coordinates.append(detector_coordinate.astype(np.int64))
-
-        # Build a mask that identifies where stabilizers are placed in the lattice
-        # syndrome_x marks positions of X stabilizers (value 1)
-        # syndrome_z is a rotated version and scaled by 3 to encode Z stabilizers
-        sz = self.distance + 1
-        syndrome_x = np.zeros((sz, sz), dtype=np.uint8)
-        syndrome_x[::2, 1:sz - 1:2] = 1
-        syndrome_x[1::2, 2::2] = 1
-        syndrome_z = np.rot90(syndrome_x) * 3
-
-        # The final syndrome mask distinguishes X (1) and Z (3) stabilizers
-        self.syndrome_mask = syndrome_x + syndrome_z
+            coordinates = circuit.get_detector_coordinates()
+            detector_coordinates = np.array([v[-3:] for v in coordinates.values()])
+            detector_coordinates -= detector_coordinates.min(axis=0)
+            self.detector_coordinates.append(detector_coordinates.astype(np.int64))
 
     def sample_syndromes(self, sampler_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -249,9 +233,8 @@ class Dataset:
                 was used for this batch.
 
         Returns:
-            node_features: ndarray of shape [n, 5] where each row is (x, y, t, type_x, type_z).
+            node_features: ndarray of shape [n, 3] where each row is (x, y, t).
                 - x, y, t: spatial and temporal position of a detection event
-                - type_x, type_z: one-hot encoding of stabilizer type
             batch_labels: ndarray of shape [n], mapping each node to a batch element
             chunk_labels: ndarray of shape [n], mapping each node to a time chunk (graph)
         Note:
@@ -278,7 +261,7 @@ class Dataset:
         g = self.t[0] - self.dt + 2
 
         # Combine all node features into a single array [total_nodes, 3]
-        node_features = np.vstack(node_features)
+        node_features = np.vstack(node_features).astype(np.float32)
 
         if not self.sliding:
             # If sliding window is not used, manually compute chunk index and local time:
@@ -286,14 +269,6 @@ class Dataset:
             #   - local_t = t % dt
             chunk_labels = node_features[:, -1] // self.dt
             node_features[:, -1] = node_features[:, -1] % self.dt
-
-        # Determine stabilizer type at each (x, y) coordinate using the precomputed mask
-        # syndrome_mask == 3 indicates Z stabilizer; else it's X stabilizer
-        stabilizer_type = self.syndrome_mask[node_features[:, 1], node_features[:, 0]] == 3
-        stabilizer_type = stabilizer_type[:, np.newaxis]  # Shape: [n, 1]
-
-        # Add one-hot stabilizer type to feature vector: [x, y, t, is_Z, is_X]
-        node_features = np.hstack((node_features, stabilizer_type, ~stabilizer_type)).astype(np.float32)
 
         return node_features, batch_labels, chunk_labels
 
@@ -354,12 +329,12 @@ class Dataset:
         sampler_idx = np.random.choice(len(self.samplers))
         syndromes, flips = self.sample_syndromes(sampler_idx)
 
-        # Keep only labels at chunk boundaries (i.e., end of each chunk)
-        flips = flips[:, self.dt - 1:]  # shape: [batch_size, g - 1], where g = t - dt + 2
+        # # Keep only labels at chunk boundaries (i.e., end of each chunk)
+        # flips = flips[:, self.dt - 1:]  # shape: [batch_size, g - 1], where g = t - dt + 2
         flips = torch.from_numpy(flips).to(dtype=torch.float32, device=self.device)
-        # Append the last label one more time to get [B, g]
-        last_label = flips[:, -1:]  # shape [B, 1]
-        flips = torch.cat([flips, last_label], dim=1)  # shape [B, g]
+        # # Append the last label one more time to get [B, g]
+        # last_label = flips[:, -1:]  # shape [B, 1]
+        # flips = torch.cat([flips, last_label], dim=1)  # shape [B, g]
 
         # Extract graph structure and labels for non-empty chunks
         node_features, batch_labels, chunk_labels = self.get_node_features(syndromes, sampler_idx)
@@ -375,8 +350,8 @@ class Dataset:
         # Extract graph edges and attributes
         edge_index, edge_attr = self.get_edges(node_features, labels)
 
-        # align labels with chunk indices: 
-        aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips)
+        # # align labels with chunk indices: 
+        # aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips)
 
         # Move everything to the appropriate device
         node_features = node_features.to(self.device)
@@ -384,57 +359,57 @@ class Dataset:
         label_map = label_map.to(dtype=torch.float32, device=self.device)
         edge_index = edge_index.to(self.device)
         edge_attr = edge_attr.to(self.device)
-        lengths = lengths.to(self.device)
+        # lengths = lengths.to(self.device)
 
-        return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label
+        return node_features, edge_index, labels, label_map, edge_attr, flips
     
-    def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
-        """
-        Align labels from full chunk structure to compact GRU outputs.
+    # def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
+    #     """
+    #     Align labels from full chunk structure to compact GRU outputs.
 
-        Args:
-            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
-                                Must be sorted by batch_idx (ascending).
-            flips_full (Tensor): shape [B, g], full labels for all possible chunks.
+    #     Args:
+    #         label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
+    #                             Must be sorted by batch_idx (ascending).
+    #         flips_full (Tensor): shape [B, g], full labels for all possible chunks.
 
-        Returns:
-            aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
-            lengths (Tensor): shape [B], number of real chunks per batch element.
+    #     Returns:
+    #         aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
+    #         lengths (Tensor): shape [B], number of real chunks per batch element.
 
-        Example:
-            If flips_full = [[a, -, b, c], [d, e, -, f]]
-            and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1], [1,3]]
-            then aligned_flips = [[a, b, c], [d, e, f]]
-            and lengths = [3, 3]
-        """
+    #     Example:
+    #         If flips_full = [[a, -, b, c], [d, e, -, f]]
+    #         and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1], [1,3]]
+    #         then aligned_flips = [[a, b, c], [d, e, f]]
+    #         and lengths = [3, 3]
+    #     """
         
-        B = self.batch_size
-        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
-        max_len = lengths.max().item()
+    #     B = self.batch_size
+    #     lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
+    #     max_len = lengths.max().item()
 
-        batch_idxs = label_map[:, 0].long()   # [n_valid]
-        chunk_idxs = label_map[:, 1].long()   # [n_valid]
+    #     batch_idxs = label_map[:, 0].long()   # [n_valid]
+    #     chunk_idxs = label_map[:, 1].long()   # [n_valid]
 
-        # Compute correct relative positions (resets counter per batch)
-        rel_pos = torch.zeros_like(batch_idxs)
-        current_batch = batch_idxs[0].item()
-        counter = 0
-        for i in range(batch_idxs.size(0)):
-            b = batch_idxs[i].item()
-            if b != current_batch:
-                current_batch = b
-                counter = 0
-            rel_pos[i] = counter
-            counter += 1
+    #     # Compute correct relative positions (resets counter per batch)
+    #     rel_pos = torch.zeros_like(batch_idxs)
+    #     current_batch = batch_idxs[0].item()
+    #     counter = 0
+    #     for i in range(batch_idxs.size(0)):
+    #         b = batch_idxs[i].item()
+    #         if b != current_batch:
+    #             current_batch = b
+    #             counter = 0
+    #         rel_pos[i] = counter
+    #         counter += 1
 
-        # Gather the labels to fill in
-        values = flips_full[batch_idxs, chunk_idxs]
+    #     # Gather the labels to fill in
+    #     values = flips_full[batch_idxs, chunk_idxs]
 
-        # Allocate and fill aligned label tensor
-        aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
-        aligned_flips[batch_idxs, rel_pos] = values
+    #     # Allocate and fill aligned label tensor
+    #     aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
+    #     aligned_flips[batch_idxs, rel_pos] = values
         
-        return aligned_flips, lengths
+    #     return aligned_flips, lengths
 
 
     def plot_graph(self, node_features, edge_index, labels, graph_idx):
