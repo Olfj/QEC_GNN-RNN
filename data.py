@@ -28,7 +28,7 @@ class Dataset:
     """
     def __init__(self, args: Args, flip: FlipType = FlipType.BIT):
         self.device = args.device
-        self.error_rates = args.error_rates 
+        self.error_rate = args.error_rate
         self.batch_size = args.batch_size
         self.t = args.t
         self.dt = args.dt 
@@ -67,36 +67,67 @@ class Dataset:
             - Assumes all `t` values in self.t are consistent for indexing detector coordinates.
         """
 
-        # Generate all (error_rate, t) pairs to create one circuit per setting
-        combinations = itertools.product(self.error_rates, self.t)
-
         # Build one circuit per combination, with intermediate logical observables inserted
+
+        error_rate_string = f"{int(self.error_rate * 1e3)}"
+
         if self.distance == 3:
-            path_ending = 'd3_q2_7_X_r50_p_0_005'
+            path_ending = 'd3_q2_7_X_r50_p_0_00'
         elif self.distance == 5:
-            path_ending = 'd5_q4_7_X_r50_p_0_005'
+            path_ending = 'd5_q4_7_X_r50_p_0_00'
         elif self.distance == 7:
-            path_ending = 'd7_q6_7_X_r50_p_0_005'
+            path_ending = 'd7_q6_7_X_r50_p_0_00'
         else:
             print('Please enter valid code distance.')
         
-        path = "/Users/xlmori/Desktop/QEC_GNN-RNN/circuits_ZXXZ/" + path_ending + '.stim'
+        path = "/Users/xlmori/Desktop/QEC_GNN-RNN/circuits_ZXXZ/" + path_ending + error_rate_string + '.stim'
         self.circuits = [stim.Circuit.from_file(path)]
-
+        self.dem = [
+            circuit.detector_error_model()
+            for circuit in self.circuits
+        ]
         # Compile each circuit into a Stim detector sampler for fast sampling
         self.samplers = [
-            circuit.compile_detector_sampler(seed=self.seed)
-            for circuit in self.circuits
+            dem.compile_sampler(seed=self.seed)
+            for dem in self.dem
         ]
 
         # Precompute and store the physical detector coordinates for each circuit
         # These are used to map detection event indices into real space-time coordinates
         self.detector_coordinates = []
-        for circuit in self.circuits:
-            coordinates = circuit.get_detector_coordinates()
+        for dem in self.dem:
+            coordinates = dem.get_detector_coordinates()
             detector_coordinates = np.array([v[-3:] for v in coordinates.values()])
             detector_coordinates -= detector_coordinates.min(axis=0)
+            num_shift = (self.distance**2 - 1) // 2
+            # Shift the time coordinate (+1) of all but the first perfect detectors
+            detector_coordinates[num_shift:, 2] += 1
             self.detector_coordinates.append(detector_coordinates.astype(np.int64))
+            det_times = detector_coordinates[:, -1].astype(int)
+
+            term_dets = []
+            term_logs = []
+            for ins in dem.flattened():
+                if ins.type != "error":
+                    continue
+                ts = ins.targets_copy()
+                term_dets.append(np.fromiter((t.val for t in ts if t.is_relative_detector_id()), dtype=int))
+                term_logs.append(np.fromiter((t.val for t in ts if t.is_logical_observable_id()), dtype=int))
+
+            n_terms = len(term_dets)
+
+            # --- map each term to a single time index IF it flips L0 ---
+            L0_mask   = np.array([0 in logs for logs in term_logs], dtype=bool)
+            has_dets  = np.array([dets.size > 0 for dets in term_dets], dtype=bool)
+
+            # assign flip time = max detector time in the term
+            self.time_idx  = np.full(n_terms, -1, dtype=int)
+            for i, dets in enumerate(term_dets):
+                if L0_mask[i] and has_dets[i]:
+                    # guard against out-of-range detector ids if needed:
+                    self.time_idx[i] = det_times[dets].max()
+
+            self.valid_cols = self.time_idx >= 0                    # columns that (flip L0) and have a time
 
     def sample_syndromes(self, sampler_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -112,11 +143,11 @@ class Dataset:
             flips_array: an integer array of shape [batch_size, self.t], where
                 - self.t = number of logical observable measurement points
                 Each entry flips_array[b, i] is 1 if a logical bit- or phase-flip
-                has occurred in batch element `b` at chunk `i`, 0 otherwise
+                has occurred in batch element `b` up to and including timestep `i`.
+                Otherwise, it is 0.
+
     
         Notes:
-            - The circuit used must include intermediate OBSERVABLE_INCLUDE statements
-              at chunk boundaries (e.g., after each dt rounds).
             - Only shots with at least one detection event are retained.
             - This method returns one logical label per time step, allowing
               for training of a sequential model with per-step targets.
@@ -126,18 +157,33 @@ class Dataset:
         """
 
         sampler = self.samplers[sampler_idx]
-        detection_events_list, observable_flips_list = [], []
+        detection_events_list, observable_flips_list, err_data_list = [], [], []
         # Sample until we get a batch where each element has at least
         # one detection event. 
         while len(detection_events_list) < self.batch_size: 
-            detection_events, observable_flips = sampler.sample(
-                shots=self.batch_size, separate_observables=True)
+            detection_events, observable_flips, err_data = sampler.sample(
+                shots=self.batch_size, return_errors=True)
             shots_w_flips = np.sum(detection_events, axis=1) != 0 # only include cases where there is at least one detection event.
             detection_events_list.extend(detection_events[shots_w_flips, :])
             observable_flips_list.extend(observable_flips[shots_w_flips, :])
+            err_data_list.extend(err_data[shots_w_flips, :])
         detection_array = np.array(detection_events_list[:self.batch_size])
         flips_array = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
-        return detection_array.astype(bool), flips_array
+        err_data_array = np.array(err_data_list[:self.batch_size], dtype= bool)
+
+        # --- accumulate counts per time step for ALL shots ---
+        # select only relevant columns
+        E = err_data_array[:, self.valid_cols]
+        idx = self.time_idx[self.valid_cols]
+        counts = np.zeros((self.batch_size, self.t + 1), dtype=np.uint16)
+        # add E[:, j] into counts[:, idx[j]] for all j in one go
+        np.add.at(counts, (np.arange(self.batch_size)[:, None], idx[None, :]), E)
+        # parity per time step (L0 flip or not at that step)
+        parity = counts & 1                          # [S, T], 0/1
+        # running logical value per shot (cumulative XOR over time)
+        logicals_each_round = np.bitwise_xor.accumulate(parity, axis=1).astype(np.int32)  # [S, T], 0/1
+        assert np.array_equal(logicals_each_round[:, -1], flips_array[:, 0]), "Final logical value mismatch"
+        return detection_array.astype(bool), logicals_each_round
     
     def get_sliding_window(self, node_features: list[np.ndarray], sampler_t: int
                            ) -> tuple[list[np.ndarray], np.ndarray]:
@@ -257,18 +303,9 @@ class Dataset:
         # Construct a batch_labels array that repeats batch indices according to number of events
         # Example: if shot 0 has 3 events and shot 1 has 5, this will be [0, 0, 0, 1, 1, 1, 1, 1]
         batch_labels = np.repeat(np.arange(self.batch_size), [len(i) for i in node_features])
-        counter = collections.Counter(list(zip(batch_labels, chunk_labels)))
-        g = self.t[0] - self.dt + 2
 
         # Combine all node features into a single array [total_nodes, 3]
         node_features = np.vstack(node_features).astype(np.float32)
-
-        if not self.sliding:
-            # If sliding window is not used, manually compute chunk index and local time:
-            #   - chunk = t // dt
-            #   - local_t = t % dt
-            chunk_labels = node_features[:, -1] // self.dt
-            node_features[:, -1] = node_features[:, -1] % self.dt
 
         return node_features, batch_labels, chunk_labels
 
@@ -290,7 +327,6 @@ class Dataset:
         edge_attr = 1 / edge_attr ** 2
 
         return edge_index, edge_attr
-
     def generate_batch(self):
         """
         Generates a batch of graphs. 
@@ -312,7 +348,8 @@ class Dataset:
                 [batch element, chunk].  
             edge_attr: tensor of shape [n_edges]. Represents the edge weights.
             flips: tensor of shape [batch_size, g]. Indicates if a logical 
-                bit- or phase-flip has occurred at the end of each chunk.
+                bit- or phase-flip has occurred up to and including at the end 
+                of each chunk.
             last_label: tensor of shape [batch_size, 1]. Indicates if a logical 
                 bit- or phase-flip has occurred at the end of the whole circuit.
 
@@ -322,19 +359,15 @@ class Dataset:
               steps'. This means, that there are g = t - dt + 2 chunks for each shot. 
             - Only logical observables measured at the end of each chunk are kept,
               i.e., we discard the first `dt` entries and keep the final g entries.
-            - Because stim gives t logical observables, we copy the last label to
-              the last chunk ending at the last perfect stabilizer measurement
         """
         # Sample syndromes and full logical flips per time step
         sampler_idx = np.random.choice(len(self.samplers))
-        syndromes, flips = self.sample_syndromes(sampler_idx)
+        syndromes, flips_full = self.sample_syndromes(sampler_idx)
 
-        # # Keep only labels at chunk boundaries (i.e., end of each chunk)
-        # flips = flips[:, self.dt - 1:]  # shape: [batch_size, g - 1], where g = t - dt + 2
-        flips = torch.from_numpy(flips).to(dtype=torch.float32, device=self.device)
-        # # Append the last label one more time to get [B, g]
-        # last_label = flips[:, -1:]  # shape [B, 1]
-        # flips = torch.cat([flips, last_label], dim=1)  # shape [B, g]
+        # Keep only labels at chunk boundaries (i.e., end of each possible chunk
+        flips_full = flips_full[:, self.dt - 1:]  # shape: [batch_size, g], where g = t - dt + 2
+        flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)
+        last_label = flips_full[:, -1:]  # shape [B, 1]
 
         # Extract graph structure and labels for non-empty chunks
         node_features, batch_labels, chunk_labels = self.get_node_features(syndromes, sampler_idx)
@@ -350,8 +383,8 @@ class Dataset:
         # Extract graph edges and attributes
         edge_index, edge_attr = self.get_edges(node_features, labels)
 
-        # # align labels with chunk indices: 
-        # aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips)
+        # align labels with chunk indices: 
+        aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips_full)
 
         # Move everything to the appropriate device
         node_features = node_features.to(self.device)
@@ -359,57 +392,57 @@ class Dataset:
         label_map = label_map.to(dtype=torch.float32, device=self.device)
         edge_index = edge_index.to(self.device)
         edge_attr = edge_attr.to(self.device)
-        # lengths = lengths.to(self.device)
+        lengths = lengths.to(self.device)
 
-        return node_features, edge_index, labels, label_map, edge_attr, flips
+        return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label
     
-    # def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
-    #     """
-    #     Align labels from full chunk structure to compact GRU outputs.
+    def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
+        """
+        Align labels from full chunk structure to compact GRU outputs.
 
-    #     Args:
-    #         label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
-    #                             Must be sorted by batch_idx (ascending).
-    #         flips_full (Tensor): shape [B, g], full labels for all possible chunks.
+        Args:
+            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
+                                Must be sorted by batch_idx (ascending).
+            flips_full (Tensor): shape [B, g], full labels for all possible chunks.
 
-    #     Returns:
-    #         aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
-    #         lengths (Tensor): shape [B], number of real chunks per batch element.
+        Returns:
+            aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
+            lengths (Tensor): shape [B], number of real chunks per batch element.
 
-    #     Example:
-    #         If flips_full = [[a, -, b, c], [d, e, -, f]]
-    #         and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1], [1,3]]
-    #         then aligned_flips = [[a, b, c], [d, e, f]]
-    #         and lengths = [3, 3]
-    #     """
+        Example:
+            If flips_full = [[a, -, b, c], [d, e, -, -]]
+            and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1]]
+            then aligned_flips = [[a, b, c], [d, e, 0]]
+            and lengths = [3, 2]
+        """
         
-    #     B = self.batch_size
-    #     lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
-    #     max_len = lengths.max().item()
+        B = self.batch_size
+        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
+        max_len = lengths.max().item()
 
-    #     batch_idxs = label_map[:, 0].long()   # [n_valid]
-    #     chunk_idxs = label_map[:, 1].long()   # [n_valid]
+        batch_idxs = label_map[:, 0].long()   # [n_valid]
+        chunk_idxs = label_map[:, 1].long()   # [n_valid]
 
-    #     # Compute correct relative positions (resets counter per batch)
-    #     rel_pos = torch.zeros_like(batch_idxs)
-    #     current_batch = batch_idxs[0].item()
-    #     counter = 0
-    #     for i in range(batch_idxs.size(0)):
-    #         b = batch_idxs[i].item()
-    #         if b != current_batch:
-    #             current_batch = b
-    #             counter = 0
-    #         rel_pos[i] = counter
-    #         counter += 1
+        # Compute correct relative positions (resets counter per batch)
+        rel_pos = torch.zeros_like(batch_idxs)
+        current_batch = batch_idxs[0].item()
+        counter = 0
+        for i in range(batch_idxs.size(0)):
+            b = batch_idxs[i].item()
+            if b != current_batch:
+                current_batch = b
+                counter = 0
+            rel_pos[i] = counter
+            counter += 1
 
-    #     # Gather the labels to fill in
-    #     values = flips_full[batch_idxs, chunk_idxs]
+        # Gather the labels to fill in
+        values = flips_full[batch_idxs, chunk_idxs]
 
-    #     # Allocate and fill aligned label tensor
-    #     aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
-    #     aligned_flips[batch_idxs, rel_pos] = values
+        # Allocate and fill aligned label tensor
+        aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
+        aligned_flips[batch_idxs, rel_pos] = values
         
-    #     return aligned_flips, lengths
+        return aligned_flips, lengths
 
 
     def plot_graph(self, node_features, edge_index, labels, graph_idx):

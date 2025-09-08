@@ -5,8 +5,8 @@ import torch
 class Args:
 
     # Stim 
-    error_rates: list[float] = field(default_factory=lambda: [0.001, 0.002, 0.003, 0.004, 0.005])
-    t: list[int] = field(default_factory=lambda: [99])
+    error_rate: float = 0.001
+    t: int = 50
     dt: int = 2
     distance: int = 5
     sliding: bool = True
