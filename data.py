@@ -171,17 +171,30 @@ class Dataset:
         flips_array = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
         err_data_array = np.array(err_data_list[:self.batch_size], dtype= bool)
 
-        # --- accumulate counts per time step for ALL shots ---
-        # select only relevant columns
-        E = err_data_array[:, self.valid_cols]
-        idx = self.time_idx[self.valid_cols]
-        counts = np.zeros((self.batch_size, self.t + 1), dtype=np.uint16)
-        # add E[:, j] into counts[:, idx[j]] for all j in one go
-        np.add.at(counts, (np.arange(self.batch_size)[:, None], idx[None, :]), E)
-        # parity per time step (L0 flip or not at that step)
-        parity = counts & 1                          # [S, T], 0/1
-        # running logical value per shot (cumulative XOR over time)
-        logicals_each_round = np.bitwise_xor.accumulate(parity, axis=1).astype(np.int32)  # [S, T], 0/1
+        # --- accumulate counts per time step for ALL shots (fast, no add.at) ---
+        E   = err_data_array[:, self.valid_cols].astype(np.uint8)   # [S, M]
+        idx = self.time_idx[self.valid_cols].astype(np.int32)       # [M]
+        T   = self.t + 1
+
+        # 1) sort columns by their time bin
+        order      = np.argsort(idx, kind="stable")
+        E_sorted   = E[:, order]              # [S, M]
+        idx_sorted = idx[order]               # [M]
+
+        # 2) find contiguous segments of equal idx
+        seg_starts = np.r_[0, np.flatnonzero(np.diff(idx_sorted)) + 1]
+        uniq_idx   = idx_sorted[seg_starts]   # unique time bins
+
+        # 3) sum each contiguous segment at once
+        counts_grouped = np.add.reduceat(E_sorted, seg_starts, axis=1)   # [S, len(uniq_idx)]
+
+        # 4) scatter into full [S, T] result
+        counts = np.zeros((self.batch_size, T), dtype=np.uint16)
+        counts[:, uniq_idx] = counts_grouped
+
+        # 5) parity + running XOR
+        parity = counts & 1
+        logicals_each_round = np.bitwise_xor.accumulate(parity, axis=1).astype(np.int32)
         assert np.array_equal(logicals_each_round[:, -1], flips_array[:, 0]), "Final logical value mismatch"
         return detection_array.astype(bool), logicals_each_round
     

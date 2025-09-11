@@ -64,6 +64,7 @@ class GRUDecoder(nn.Module):
         return predictions, final_prediction
 
 
+
     def train_model(
             self, 
             logger: TrainingLogger | None = None, 
@@ -123,7 +124,7 @@ class GRUDecoder(nn.Module):
                 # If not training all times, we only consider the final label
                 else:
                     loss = nn.functional.binary_cross_entropy(final_prediction, last_label)
-                    
+
                 # Backpropagation and optimization step
                 loss.backward()
                 optim.step()
