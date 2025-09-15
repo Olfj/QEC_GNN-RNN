@@ -407,7 +407,7 @@ class Dataset:
         edge_attr = edge_attr.to(self.device)
         lengths = lengths.to(self.device)
 
-        return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label
+        return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full
     
     def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
         """
@@ -430,7 +430,7 @@ class Dataset:
         """
         
         B = self.batch_size
-        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch
+        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch element 
         max_len = lengths.max().item()
 
         batch_idxs = label_map[:, 0].long()   # [n_valid]

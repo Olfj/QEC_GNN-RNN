@@ -9,6 +9,8 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from copy import deepcopy
 import wandb
+import numpy as np
+from scipy.stats import linregress
 os.environ["WANDB_SILENT"] = "True"
 
 class GRUDecoder(nn.Module):
@@ -99,7 +101,7 @@ class GRUDecoder(nn.Module):
                 optim.zero_grad()
     
                 t0 = time.perf_counter() 
-                x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label = dataset.generate_batch()
+                x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full = dataset.generate_batch()
 
                 t1 = time.perf_counter()
                 # Forward pass through the model
@@ -117,7 +119,10 @@ class GRUDecoder(nn.Module):
                     # Compute binary cross-entropy loss for each element without reduction
                     # loss_raw has shape [B, g_actual], matching the shape of out and aligned_flips
                     loss_raw = nn.functional.binary_cross_entropy(out, aligned_flips, reduction='none')
-
+                    # make a weight tensor: all 1's except last element is 50
+                    weights = torch.ones_like(loss_raw)
+                    weights[:, -1] = self.args.t
+                    loss_raw = loss_raw * weights
                     # Apply the mask to zero out the loss from padded (non-existent) chunks
                     # Then compute the mean loss over all valid elements
                     loss = (loss_raw * mask).sum() / mask.sum()
@@ -174,7 +179,7 @@ class GRUDecoder(nn.Module):
         data_time, model_time = 0, 0
         for i in tqdm(range(n_iter), disable=verbose):
             t0 = time.perf_counter()
-            x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label = dataset.generate_batch()
+            x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full = dataset.generate_batch()
             t1 = time.perf_counter() 
             out, final_prediction = self.forward(x, edge_index, edge_attr, batch_labels, label_map)
             t2 = time.perf_counter()
@@ -186,3 +191,57 @@ class GRUDecoder(nn.Module):
         if verbose:
             print(f"Accuracy: {accuracy:.4f}, data time = {data_time:.3f}, model time = {model_time:.3f}")
         return accuracy, std
+    def extract_epsilon(self, dataset: Dataset, n_iter=1000, verbose=True):
+        """
+        Evaluates the model by feeding n_iter batches to the decoder and 
+        calculating the mean and standard deviation of the accuracy. 
+        """
+        self.eval()
+        epsilon_list = torch.zeros(n_iter)
+        data_time, model_time = 0, 0
+        n_valid_batches = 0
+        failure_rate_per_chunk_mean = np.zeros(self.args.t)
+        for i in tqdm(range(n_iter), disable=verbose):
+            t0 = time.perf_counter()
+            x, edge_index, batch_labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full = dataset.generate_batch()
+            t1 = time.perf_counter() 
+
+            out, final_prediction = self.forward(x, edge_index, edge_attr, batch_labels, label_map)
+            t2 = time.perf_counter()
+            # print(torch.sum(out, dim=0))
+            label_map = label_map.int()
+            g_max = self.args.t - self.args.dt + 2
+            # Build index matrix from label_map
+            idx = torch.full((self.args.batch_size, g_max), -1, dtype=torch.long)
+            idx[label_map[:,0], label_map[:,1]] = torch.arange(label_map.size(0))
+
+            # Forward-fill indices
+            mask = idx != -1
+            ffill = torch.where(mask, idx, torch.zeros_like(idx))
+            ffill = ffill.cummax(dim=1).values    # forward fill each row
+
+            # Gather values
+            vals = torch.cat([out[b, :sum(mask[b]).item()] for b in range(self.args.batch_size)])
+            out_per_chunk = vals[ffill]
+
+            correct_per_chunk_and_shot = (torch.round(out_per_chunk) == flips_full)
+            correct_per_chunk = torch.sum(correct_per_chunk_and_shot, dim = 0) / self.args.batch_size
+
+            # extract epsilon_L:
+            failure_rate_per_chunk = 1 - correct_per_chunk.cpu().numpy()
+            logPL = np.log(1 - 2 * failure_rate_per_chunk)
+            failure_rate_per_chunk_mean += failure_rate_per_chunk
+            t = np.arange(self.args.dt - 1, self.args.t + 1)
+            slope, _, _, _, _ = linregress(t, logPL)
+            e_L = 0.5 * (1-np.exp(slope))
+            if not np.isnan(e_L):
+                epsilon_list[i] = e_L
+                n_valid_batches += 1
+            data_time += t1 - t0
+            model_time += t2 - t1
+        print(np.array2string(failure_rate_per_chunk_mean / n_iter, separator=", "))
+        epsilon = epsilon_list.mean()
+        std = standard_deviation(epsilon, n_iter * dataset.batch_size)
+        if verbose:
+            print(f"Epsilon_L: {epsilon:.6f}, no.valid batches: {n_valid_batches}, data time = {data_time:.3f}, model time = {model_time:.3f}")
+        return epsilon, std

@@ -40,7 +40,7 @@ if __name__ == "__main__":
         embedding_features=[3, 32, 64, 128, 256, 512],
         hidden_size=512,
         n_gru_layers=4,
-        log_wandb=False
+        log_wandb=True
     )
     current_datetime = datetime.now().strftime("%y%m%d_%H%M%S")
     model_name = 'google_' + 'd' + str(d) + '_p' + str(p) + '_t' + str(t) + '_dt' + str(dt) + '_' + current_datetime

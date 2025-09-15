@@ -6,7 +6,7 @@ from mwmp import test_mwpm
 import torch
 import argparse
 import numpy as np
-# python examples/test_nn.py --d 5 --t 49 --dt 2 --p 0.001 --load_path distance3
+# python examples/test_nn.py --d 5 --t 49 --dt 2 --p 0.001 --batch_size 100 --load_path distance3
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser.add_argument('--t', type=int, default=49)
     parser.add_argument('--dt', type=int, default=2)
     parser.add_argument('--p', type=float, default=0.001)
+    parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--load_path', type=str, default=None)
 
     args_cli = parser.parse_args()
@@ -21,12 +22,12 @@ if __name__ == "__main__":
 
     args = Args(
         distance=args_cli.d,
-        error_rates=[args_cli.p],
-        t=[args_cli.t],
+        error_rate=args_cli.p,
+        t=args_cli.t,
         dt=args_cli.dt,
         sliding=True,
-        batch_size=1000,
-        embedding_features=[5, 32, 64, 128, 256, 512],
+        batch_size=args_cli.batch_size,
+        embedding_features=[3, 32, 64, 128, 256, 512],
         hidden_size=512,
         n_gru_layers=4,
         seed=42 
@@ -38,22 +39,18 @@ if __name__ == "__main__":
     n_iter = 1000
     decoder.to(args.device)  # Move model to MPS or appropriate device
     accuracies = []
-    for t in [9, 14, 24, 49, 74, 99, 249, 499, 749, 999]:
+    for t in [250]:
         print('Starting with t=',t)
         args = Args(
             distance=args_cli.d,
-            error_rates=[args_cli.p],
-            t=[t],
+            error_rate=args_cli.p,
+            t=t,
             dt=args_cli.dt,
             sliding=True,
-            batch_size=1000,
-            embedding_features=[5, 32, 64, 128, 256],
-            hidden_size=128,
-            n_gru_layers=4,
-            seed=42 
-        )
-        acc, std = decoder.test_model(Dataset(args), n_iter=n_iter)
+            batch_size=args_cli.batch_size,
+            embedding_features=[3, 32, 64, 128, 256, 512],
+            hidden_size=512,
+            n_gru_layers=4)
+        acc, std = decoder.extract_epsilon(Dataset(args), n_iter=n_iter)
         accuracies.append(acc)
-        print(t, acc)
-    print(accuracies)
-    np.savetxt(f"results_{load_path}_p_{args_cli.p}.csv", accuracies)
+    # np.savetxt(f"results_{load_path}_p_{args_cli.p}.csv", accuracies)
