@@ -81,6 +81,7 @@ class Dataset:
             print('Please enter valid code distance.')
         
         path = "/Users/xlmori/Desktop/QEC_GNN-RNN/circuits_ZXXZ/" + path_ending + error_rate_string + '.stim'
+        # path = '/Users/xlmori/Desktop/QEC_GNN-RNN/google_105Q_surface_code_d3_d5_d7/d3_at_q2_7/X/r250/circuit_noisy_si1000.stim'
         self.circuits = [stim.Circuit.from_file(path)]
         self.dem = [
             circuit.detector_error_model()
@@ -376,7 +377,6 @@ class Dataset:
         # Sample syndromes and full logical flips per time step
         sampler_idx = np.random.choice(len(self.samplers))
         syndromes, flips_full = self.sample_syndromes(sampler_idx)
-
         # Keep only labels at chunk boundaries (i.e., end of each possible chunk
         flips_full = flips_full[:, self.dt - 1:]  # shape: [batch_size, g], where g = t - dt + 2
         flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)

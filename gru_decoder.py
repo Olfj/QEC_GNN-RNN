@@ -229,6 +229,7 @@ class GRUDecoder(nn.Module):
 
             # extract epsilon_L:
             failure_rate_per_chunk = 1 - correct_per_chunk.cpu().numpy()
+            print(i)
             logPL = np.log(1 - 2 * failure_rate_per_chunk)
             failure_rate_per_chunk_mean += failure_rate_per_chunk
             t = np.arange(self.args.dt - 1, self.args.t + 1)
