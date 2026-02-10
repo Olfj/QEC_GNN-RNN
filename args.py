@@ -9,11 +9,11 @@ class Args:
     t: int = 50
     dt: int = 2
     distance: int = 5
-    sliding: bool = True
     k: int = 20
     seed: int | None = None
     norm: float | int = torch.inf
-    train_all_times: bool = True
+    label_mode: str = "error_chain"  # "last", "mpp", or "error_chain"
+    weight_last: bool = False  # upweight the final chunk's loss by factor t
 
     # Torch
     device: torch.device = field(

@@ -1,15 +1,91 @@
-import stim 
+import stim
 import numpy as np
-import numpy.typing as npt
 import torch
 from tqdm import tqdm
-import time, itertools
+import time
 import matplotlib.pyplot as plt
 from enum import Enum
 from args import Args
 from torch_geometric.nn.pool import knn_graph
-from utils import make_surface_code_with_logical_z_tracking
-import collections
+
+
+def add_mpp_to_circuit(circuit: stim.Circuit, distance: int) -> stim.Circuit:
+    """Insert noiseless MPP Z_L after each MR block for intermediate logical labels.
+
+    obs 0 = final logical (unchanged), obs 1..N = intermediate logicals per round.
+    """
+    qubit_coords = {}
+    for ins in circuit.flattened():
+        if ins.name == "QUBIT_COORDS":
+            args = ins.gate_args_copy()
+            for t in ins.targets_copy():
+                qubit_coords[t.value] = tuple(args)
+
+    data_qubits = []
+    for ins in circuit.flattened():
+        if ins.name == "M":
+            data_qubits = [t.value for t in ins.targets_copy()]
+
+    if qubit_coords and data_qubits:
+        data_coords = {q: qubit_coords[q] for q in data_qubits if q in qubit_coords}
+        min_y = min(y for _, y in data_coords.values())
+        logical_z_qubits = sorted(
+            [q for q, (_, y) in data_coords.items() if y == min_y]
+        )
+    else:
+        logical_z_qubits = [1, 3, 5]
+
+    n_anc = distance**2 - 1
+
+    def shift_rec(x, std_count, mpp_count):
+        std_pos = std_count + x
+        num_mpps_before = min(std_pos // n_anc, mpp_count)
+        return x + num_mpps_before - mpp_count
+
+    modified = stim.Circuit()
+    std_count = 0
+    mpp_count = 0
+    obs_idx = 1
+
+    for ins in circuit.flattened():
+        name = ins.name
+
+        if name == "DETECTOR":
+            targets = ins.targets_copy()
+            args = ins.gate_args_copy()
+            shifted = [
+                stim.target_rec(shift_rec(t.value, std_count, mpp_count))
+                for t in targets
+            ]
+            modified.append("DETECTOR", shifted, args)
+        elif name == "OBSERVABLE_INCLUDE":
+            targets = ins.targets_copy()
+            args = ins.gate_args_copy()
+            obs_id = int(args[0]) if args else 0
+            shifted = [
+                stim.target_rec(shift_rec(t.value, std_count, mpp_count))
+                for t in targets
+            ]
+            modified.append("OBSERVABLE_INCLUDE", shifted, obs_id)
+        else:
+            modified.append(ins)
+
+        if name in ["M", "MR"]:
+            std_count += len(ins.targets_copy())
+
+        if name == "MR":
+            mpp_targets = []
+            for i, q in enumerate(logical_z_qubits):
+                mpp_targets.append(stim.target_z(q))
+                if i < len(logical_z_qubits) - 1:
+                    mpp_targets.append(stim.target_combiner())
+            modified.append("MPP", mpp_targets)
+            modified.append("OBSERVABLE_INCLUDE", [stim.target_rec(-1)], obs_idx)
+            obs_idx += 1
+            mpp_count += 1
+
+    return modified
+
 
 class FlipType(Enum):
     BIT = 1
@@ -18,93 +94,77 @@ class FlipType(Enum):
 class Dataset:
     """
     Class that is used to generate graphs of errors that occur
-    in quantum computers. 
+    in quantum computers.
 
     Call generate_batch() to generate a batch of graphs.
 
     References:
     https://github.com/quantumlib/Stim/blob/main/doc/getting_started.ipynb
-    https://github.com/LangeMoritz/GNN_decoder 
+    https://github.com/LangeMoritz/GNN_decoder
     """
     def __init__(self, args: Args, flip: FlipType = FlipType.BIT):
         self.device = args.device
         self.error_rate = args.error_rate
         self.batch_size = args.batch_size
         self.t = args.t
-        self.dt = args.dt 
+        self.dt = args.dt
         self.distance = args.distance
         self.n_stabilizers = self.distance ** 2 - 1
-        self.sliding = args.sliding
         self.k = args.k
         self.seed = args.seed
         self.norm = args.norm
-        
-        if not self.sliding:
-            for t in args.t:
-                assert t % args.dt == args.dt - 1 
+        self.label_mode = args.label_mode
+
         if flip is FlipType.BIT:
             self.code_task = "surface_code:rotated_memory_z"
         elif flip is FlipType.PHASE:
             self.code_task = "surface_code:rotated_memory_x"
-        else: 
+        else:
             raise AttributeError("Unknown flip type.")
         self.__init_circuit()
-    
+
     def __init_circuit(self):
         """
-        Initializes the Stim circuits used for sampling detection events and logical observables.
-
-        This involves:
-        - Creating a list of circuits for each (error_rate, t) combination using
-          `make_surface_code_with_intermediate_observables`, which includes intermediate
-          OBSERVABLE_INCLUDE instructions to enable time-resolved logical labels.
-        - Compiling those circuits into Stim detector samplers.
-        - Precomputing and storing the physical detector coordinates for each circuit.
-        - Building a syndrome mask (stabilizer layout) to identify stabilizer types (X vs Z).
-
-        Note:
-            - Currently only supports "rotated_memory_x" (phase-flip decoding).
-            - Assumes all `t` values in self.t are consistent for indexing detector coordinates.
+        Initializes circuits and samplers based on self.label_mode:
+        - "last": DEM sampler, no intermediate label precomputation
+        - "error_chain": DEM sampler + error mechanism -> time mapping
+        - "mpp": MPP circuit detector sampler for intermediate labels
         """
+        circuit = stim.Circuit.generated(
+            self.code_task,
+            distance=self.distance,
+            rounds=self.t,
+            after_clifford_depolarization=self.error_rate,
+            after_reset_flip_probability=self.error_rate,
+            before_measure_flip_probability=self.error_rate,
+            before_round_data_depolarization=self.error_rate,
+        )
+        self.circuits = [circuit]
+        self.dem = [circuit.detector_error_model()]
 
-        # Build one circuit per combination, with intermediate logical observables inserted
+        # DEM sampler (used by "last" and "error_chain" modes)
+        self.samplers = [dem.compile_sampler(seed=self.seed) for dem in self.dem]
 
-        error_rate_string = f"{int(self.error_rate * 1e3)}"
-
-        if self.distance == 3:
-            path_ending = 'd3_q2_7_X_r50_p_0_00'
-        elif self.distance == 5:
-            path_ending = 'd5_q4_7_X_r50_p_0_00'
-        elif self.distance == 7:
-            path_ending = 'd7_q6_7_X_r50_p_0_00'
-        else:
-            print('Please enter valid code distance.')
-        
-        path = "/Users/xlmori/Desktop/QEC_GNN-RNN/circuits_ZXXZ/" + path_ending + error_rate_string + '.stim'
-        # path = '/Users/xlmori/Desktop/QEC_GNN-RNN/google_105Q_surface_code_d3_d5_d7/d3_at_q2_7/X/r250/circuit_noisy_si1000.stim'
-        self.circuits = [stim.Circuit.from_file(path)]
-        self.dem = [
-            circuit.detector_error_model()
-            for circuit in self.circuits
-        ]
-        # Compile each circuit into a Stim detector sampler for fast sampling
-        self.samplers = [
-            dem.compile_sampler(seed=self.seed)
-            for dem in self.dem
-        ]
-
-        # Precompute and store the physical detector coordinates for each circuit
-        # These are used to map detection event indices into real space-time coordinates
+        # Detector coordinates (always needed for graph construction)
         self.detector_coordinates = []
+        self._sampler_t = []
         for dem in self.dem:
             coordinates = dem.get_detector_coordinates()
             detector_coordinates = np.array([v[-3:] for v in coordinates.values()])
             detector_coordinates -= detector_coordinates.min(axis=0)
-            num_shift = (self.distance**2 - 1) // 2
-            # Shift the time coordinate (+1) of all but the first perfect detectors
-            detector_coordinates[num_shift:, 2] += 1
             self.detector_coordinates.append(detector_coordinates.astype(np.int64))
-            det_times = detector_coordinates[:, -1].astype(int)
+            self._sampler_t.append(int(detector_coordinates[:, -1].max()))
+
+        # Mode-specific initialization
+        if self.label_mode == "error_chain":
+            self._init_error_chain_data()
+        elif self.label_mode == "mpp":
+            self._init_mpp_samplers()
+
+    def _init_error_chain_data(self):
+        """Precompute error mechanism -> time mapping for error-chain labels."""
+        for idx, dem in enumerate(self.dem):
+            det_times = self.detector_coordinates[idx][:, -1].astype(int)
 
             term_dets = []
             term_logs = []
@@ -116,115 +176,114 @@ class Dataset:
                 term_logs.append(np.fromiter((t.val for t in ts if t.is_logical_observable_id()), dtype=int))
 
             n_terms = len(term_dets)
+            L0_mask = np.array([0 in logs for logs in term_logs], dtype=bool)
+            has_dets = np.array([dets.size > 0 for dets in term_dets], dtype=bool)
 
-            # --- map each term to a single time index IF it flips L0 ---
-            L0_mask   = np.array([0 in logs for logs in term_logs], dtype=bool)
-            has_dets  = np.array([dets.size > 0 for dets in term_dets], dtype=bool)
-
-            # assign flip time = max detector time in the term
-            self.time_idx  = np.full(n_terms, -1, dtype=int)
+            self.time_idx = np.full(n_terms, -1, dtype=int)
             for i, dets in enumerate(term_dets):
                 if L0_mask[i] and has_dets[i]:
-                    # guard against out-of-range detector ids if needed:
                     self.time_idx[i] = det_times[dets].max()
 
-            self.valid_cols = self.time_idx >= 0                    # columns that (flip L0) and have a time
+            self.valid_cols = self.time_idx >= 0
+
+    def _init_mpp_samplers(self):
+        """Build MPP circuits and compile their detector samplers."""
+        self.mpp_circuits = [add_mpp_to_circuit(c, self.distance) for c in self.circuits]
+        self.mpp_samplers = [c.compile_detector_sampler(seed=self.seed) for c in self.mpp_circuits]
 
     def sample_syndromes(self, sampler_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """
-        Samples a batch of detection events and corresponding logical observables
-        from a Stim circuit compiled with intermediate observable tracking.
-    
-        Returns:
-            detection_array: a boolean array of shape [batch_size, s] where
-                - s = total number of detectors = t * num_stabilizers.
-                Each entry indicates whether a detection event occurred on a 
-                given stabilizer at a given round.
-            
-            flips_array: an integer array of shape [batch_size, self.t], where
-                - self.t = number of logical observable measurement points
-                Each entry flips_array[b, i] is 1 if a logical bit- or phase-flip
-                has occurred in batch element `b` up to and including timestep `i`.
-                Otherwise, it is 0.
+        Samples detection events and logical labels. Return shape depends on label_mode:
+        - "last":        (detection_array [B, s], last_flip [B, 1])
+        - "error_chain": (detection_array [B, s], logicals_each_round [B, T])
+        - "mpp":         (detection_array [B, s], logicals_each_round [B, T])
 
-    
-        Notes:
-            - Only shots with at least one detection event are retained.
-            - This method returns one logical label per time step, allowing
-              for training of a sequential model with per-step targets.
-            - When setting the number of QEC rounds to t, stim will return t + 1 X
-            stabilizers, and t - 1 Z stabilizers. In total, there are t + 1 'time 
-            steps'. This means, that there are g = t - dt + 2 chunks for each shot. 
+        Only shots with at least one detection event are retained.
         """
+        if self.label_mode == "last":
+            return self._sample_last(sampler_idx)
+        elif self.label_mode == "mpp":
+            return self._sample_mpp(sampler_idx)
+        else:
+            return self._sample_error_chain(sampler_idx)
 
+    def _sample_last(self, sampler_idx: int):
+        """Sample from DEM, return only final logical label."""
+        sampler = self.samplers[sampler_idx]
+        detection_events_list, observable_flips_list = [], []
+        while len(detection_events_list) < self.batch_size:
+            detection_events, observable_flips, _ = sampler.sample(shots=self.batch_size)
+            shots_w_flips = np.sum(detection_events, axis=1) != 0
+            detection_events_list.extend(detection_events[shots_w_flips, :])
+            observable_flips_list.extend(observable_flips[shots_w_flips, :])
+        detection_array = np.array(detection_events_list[:self.batch_size])
+        flips_array = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
+        return detection_array.astype(bool), flips_array[:, :1]  # shape [B, 1]
+
+    def _sample_mpp(self, sampler_idx: int):
+        """Sample from MPP circuit, extract intermediate logical labels from obs_flips."""
+        sampler = self.mpp_samplers[sampler_idx]
+        num_det = self.mpp_circuits[sampler_idx].num_detectors
+        detection_events_list, observable_flips_list = [], []
+        while len(detection_events_list) < self.batch_size:
+            result = sampler.sample(shots=self.batch_size, append_observables=True)
+            detection_events = result[:, :num_det]
+            observable_flips = result[:, num_det:]
+            shots_w_flips = np.sum(detection_events, axis=1) != 0
+            detection_events_list.extend(detection_events[shots_w_flips, :])
+            observable_flips_list.extend(observable_flips[shots_w_flips, :])
+        detection_array = np.array(detection_events_list[:self.batch_size])
+        obs_flips = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
+        # obs_flips[:, 1:] = intermediate logicals (noiseless MPP after each MR round, times 0..t-1)
+        # obs_flips[:, 0]  = final logical (from noisy data qubit M, time t)
+        logicals_each_round = np.hstack([obs_flips[:, 1:], obs_flips[:, 0:1]])
+        return detection_array.astype(bool), logicals_each_round
+
+    def _sample_error_chain(self, sampler_idx: int):
+        """Sample from DEM with return_errors, compute intermediate labels from error mechanisms."""
         sampler = self.samplers[sampler_idx]
         detection_events_list, observable_flips_list, err_data_list = [], [], []
-        # Sample until we get a batch where each element has at least
-        # one detection event. 
-        while len(detection_events_list) < self.batch_size: 
+        while len(detection_events_list) < self.batch_size:
             detection_events, observable_flips, err_data = sampler.sample(
                 shots=self.batch_size, return_errors=True)
-            shots_w_flips = np.sum(detection_events, axis=1) != 0 # only include cases where there is at least one detection event.
+            shots_w_flips = np.sum(detection_events, axis=1) != 0
             detection_events_list.extend(detection_events[shots_w_flips, :])
             observable_flips_list.extend(observable_flips[shots_w_flips, :])
             err_data_list.extend(err_data[shots_w_flips, :])
         detection_array = np.array(detection_events_list[:self.batch_size])
         flips_array = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
-        err_data_array = np.array(err_data_list[:self.batch_size], dtype= bool)
+        err_data_array = np.array(err_data_list[:self.batch_size], dtype=bool)
 
-        # --- accumulate counts per time step for ALL shots (fast, no add.at) ---
-        E   = err_data_array[:, self.valid_cols].astype(np.uint8)   # [S, M]
-        idx = self.time_idx[self.valid_cols].astype(np.int32)       # [M]
-        T   = self.t + 1
+        # Accumulate counts per time step for all shots
+        E = err_data_array[:, self.valid_cols].astype(np.uint8)
+        idx = self.time_idx[self.valid_cols].astype(np.int32)
+        T = self._sampler_t[0] + 1
 
-        # 1) sort columns by their time bin
-        order      = np.argsort(idx, kind="stable")
-        E_sorted   = E[:, order]              # [S, M]
-        idx_sorted = idx[order]               # [M]
+        order = np.argsort(idx, kind="stable")
+        E_sorted = E[:, order]
+        idx_sorted = idx[order]
 
-        # 2) find contiguous segments of equal idx
         seg_starts = np.r_[0, np.flatnonzero(np.diff(idx_sorted)) + 1]
-        uniq_idx   = idx_sorted[seg_starts]   # unique time bins
+        uniq_idx = idx_sorted[seg_starts]
 
-        # 3) sum each contiguous segment at once
-        counts_grouped = np.add.reduceat(E_sorted, seg_starts, axis=1)   # [S, len(uniq_idx)]
+        counts_grouped = np.add.reduceat(E_sorted, seg_starts, axis=1)
 
-        # 4) scatter into full [S, T] result
         counts = np.zeros((self.batch_size, T), dtype=np.uint16)
         counts[:, uniq_idx] = counts_grouped
 
-        # 5) parity + running XOR
         parity = counts & 1
         logicals_each_round = np.bitwise_xor.accumulate(parity, axis=1).astype(np.int32)
-        assert np.array_equal(logicals_each_round[:, -1], flips_array[:, 0]), "Final logical value mismatch"
+        assert np.array_equal(logicals_each_round[:, -1], flips_array[:, 0]), \
+            "Error-chain final logical value mismatch"
         return detection_array.astype(bool), logicals_each_round
-    
+
     def get_sliding_window(self, node_features: list[np.ndarray], sampler_t: int
                            ) -> tuple[list[np.ndarray], np.ndarray]:
         """
         Applies a sliding window to the input node features in time,
         segmenting each shot's data into overlapping time chunks.
 
-        This is used to divide each graph (shot) into smaller graph segments
-        that span dt rounds of the circuit. The result is a per-chunk 
-        representation suitable for sequential processing (e.g., in an RNN).
-
-        Args:
-            node_features: List of length batch_size. Each element is an array of 
-                shape [n_i, 3] containing the node features (x, y, t) for a single
-                shot (i.e., detection events).
-            sampler_t: The number of rounds used in the circuit (i.e., full time duration, = t).
-
-        Returns:
-            A tuple (node_features, chunk_labels):
-                node_features: Modified list where each entry's coordinates are mapped 
-                    into chunk-local time and reordered to align with chunk boundaries.
-                chunk_labels: A 1D array indicating to which chunk (window) each 
-                    node in the batch belongs. This is later used for pooling and batching.
-        Note:
-            - When setting the number of QEC rounds to t, stim will return t + 1 X
-            stabilizers, and t - 1 Z stabilizers. In total, there are t + 1 'time 
-            steps'. This means, that there are g = t - dt + 2 chunks for each shot. 
+        There are g = t - dt + 2 chunks for each shot.
         """
         chunk_labels = [0] * len(node_features)  # Placeholder for per-batch chunk label arrays
 
@@ -239,92 +298,55 @@ class Dataset:
 
             # Scale counts to estimate total number of node events after splitting
             counts[start] *= (times + 1)[start]                     # Early window
-
-            counts[middle] *= self.dt                              # Full windows
-            counts[end] *= -((times - 1) - sampler_t)[end]         # Late window
+            counts[middle] *= self.dt                                # Full windows
+            counts[end] *= -((times - 1) - sampler_t)[end]          # Late window
             new_size = np.sum(counts)
-            # Allocate space for new coordinates and chunk indices
 
+            # Allocate space for new coordinates and chunk indices
             new_coordinates = np.zeros((new_size, 3), dtype=np.uint64)
             chunk_label = np.zeros(new_size, dtype=np.uint64)
 
             # Sliding window index vector: [0, 1, ..., sampler_t - dt + 1]
             j_values = np.arange(sampler_t - self.dt + 2)[:, None]  # Shape: [num_chunks, 1]
-
             # Time values reshaped for broadcasting
-            time_column = coordinates[:, -1][None, :]  # Shape: [1, num_points]
-
+            time_column = coordinates[:, -1][None, :]                # Shape: [1, num_points]
             # Create boolean mask indicating which time steps belong to which chunk
-            mask = (time_column < j_values + self.dt) & (time_column >= j_values)  # Shape: [num_chunks, num_points]
+            mask = (time_column < j_values + self.dt) & (time_column >= j_values)  # [num_chunks, num_points]
 
             # Extract all matching (chunk, index) pairs
             indices = np.where(mask)
-            
             # Sort by chunk index to maintain temporal order
             sorted_idx = np.argsort(indices[0])
             selected_points = coordinates[indices[1][sorted_idx]].copy()
-
             # Convert time coordinates to local (chunk-relative) time
             selected_points[:, -1] -= indices[0][sorted_idx]
-            
+
             # Store results
             new_coordinates[:len(selected_points)] = selected_points
-            # Store for this batch element
             chunk_label[:len(selected_points)] = indices[0][sorted_idx]
 
             node_features[batch] = new_coordinates
             chunk_labels[batch] = chunk_label
-            
+
         # Concatenate all chunk labels into one array (for the whole batch)
         chunk_labels = np.concatenate(chunk_labels)
         return node_features, chunk_labels
 
     def get_node_features(self, syndromes: np.ndarray, sampler_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Converts detection event indices into physical node features and assigns 
-        them to batch and chunk labels, optionally applying a sliding window.
-
-        Args:
-            syndromes: Boolean array of shape [batch_size, s] where s is the total
-                number of detectors (t * number of stabilizers). Each entry indicates
-                whether a detection event occurred at a given space-time location.
-            sampler_idx: Index into the list of circuits/samplers. This determines 
-                which surface code configuration (e.g., error rate, number of rounds) 
-                was used for this batch.
-
-        Returns:
-            node_features: ndarray of shape [n, 3] where each row is (x, y, t).
-                - x, y, t: spatial and temporal position of a detection event
-            batch_labels: ndarray of shape [n], mapping each node to a batch element
-            chunk_labels: ndarray of shape [n], mapping each node to a time chunk (graph)
-        Note:
-            - When setting the number of QEC rounds to t, stim will return t + 1 X
-            stabilizers, and t - 1 Z stabilizers. In total, there are t + 1 'time 
-            steps'. This means, that there are g = t - dt + 2 chunks for each shot. 
+        Converts detection event indices into physical node features (x, y, t)
+        and assigns them to batch and chunk labels via a sliding window over time.
         """
-
-        # Decode syndrome indices into (x, y, t) coordinates using precomputed Stim detector layout
-        # Result: list of arrays, one per shot, each with shape [num_events_in_shot, 3]
         node_features = [self.detector_coordinates[sampler_idx][s] for s in syndromes]
 
-        if self.sliding:
-            # Total number of rounds used in this circuit
-            sampler_t = self.circuits[sampler_idx].num_detectors // self.n_stabilizers
-            # Apply a sliding window over time to divide events into overlapping chunks
-            # Returns updated node_features with local time coordinates and chunk_labels
-            node_features, chunk_labels = self.get_sliding_window(node_features, sampler_t)
-        
-        # Construct a batch_labels array that repeats batch indices according to number of events
-        # Example: if shot 0 has 3 events and shot 1 has 5, this will be [0, 0, 0, 1, 1, 1, 1, 1]
-        batch_labels = np.repeat(np.arange(self.batch_size), [len(i) for i in node_features])
+        node_features, chunk_labels = self.get_sliding_window(node_features, self._sampler_t[sampler_idx])
 
-        # Combine all node features into a single array [total_nodes, 3]
+        batch_labels = np.repeat(np.arange(self.batch_size), [len(i) for i in node_features])
         node_features = np.vstack(node_features).astype(np.float32)
 
         return node_features, batch_labels, chunk_labels
 
-    
-    def get_edges(self, node_features: np.ndarray, labels) -> tuple[np.ndarray, np.ndarray, int]:
+    def get_edges(self, node_features: np.ndarray, labels) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns edges between nodes. The edges are of shape [n_edges, 2].
 
@@ -336,51 +358,31 @@ class Dataset:
         # Compute the distances between the nodes:
         delta = node_features[edge_index[1]] - node_features[edge_index[0]]
         edge_attr = torch.linalg.norm(delta, ord=self.norm, dim=1)
-
         # Inverse square of the norm between two nodes.
         edge_attr = 1 / edge_attr ** 2
 
         return edge_index, edge_attr
+
     def generate_batch(self):
         """
-        Generates a batch of graphs. 
+        Generates a batch of graphs.
 
-        Returns: 
-            node_features: tensor of shape [n, 5] ([x, y, t, (stabilizer type)]).
-            edge_index: tensor of shape [n_edges, 2]. Represents the edges, 
-                i.e. the adjacency matrix. 
-            labels: tensor of shape [n]. Represents which node features belong
-                to which combination of batch element and chunk. 
-                This is used when computing global_mean_pool following
-                graph convolutions. The reason being there is no 
-                explicit batch dimension. Therefore, a list of 
-                labels is needed to keep track of which node features
-                belong to which batch element. Further, each batch element
-                consists of multiple graphs, or chunks. Therefore, an integer
-                is assigned to each combination of batch element and chunk.
-            label_map: tensor of shape [n_graphs]. Maps labels to
-                [batch element, chunk].  
-            edge_attr: tensor of shape [n_edges]. Represents the edge weights.
-            flips: tensor of shape [batch_size, g]. Indicates if a logical 
-                bit- or phase-flip has occurred up to and including at the end 
-                of each chunk.
-            last_label: tensor of shape [batch_size, 1]. Indicates if a logical 
-                bit- or phase-flip has occurred at the end of the whole circuit.
-
-        Note:
-            - When setting the number of QEC rounds to t, stim will return t + 1 X
-              stabilizers, and t - 1 Z stabilizers. In total, there are t + 1 'time 
-              steps'. This means, that there are g = t - dt + 2 chunks for each shot. 
-            - Only logical observables measured at the end of each chunk are kept,
-              i.e., we discard the first `dt` entries and keep the final g entries.
+        Returns:
+            node_features, edge_index, labels, label_map, edge_attr,
+            aligned_flips, lengths, last_label, flips_full
         """
-        # Sample syndromes and full logical flips per time step
+        # Sample syndromes and logical labels
         sampler_idx = np.random.choice(len(self.samplers))
-        syndromes, flips_full = self.sample_syndromes(sampler_idx)
-        # Keep only labels at chunk boundaries (i.e., end of each possible chunk
-        flips_full = flips_full[:, self.dt - 1:]  # shape: [batch_size, g], where g = t - dt + 2
-        flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)
-        last_label = flips_full[:, -1:]  # shape [B, 1]
+        syndromes, label_data = self.sample_syndromes(sampler_idx)
+
+        if self.label_mode == "last":
+            last_label = torch.from_numpy(label_data).to(dtype=torch.float32, device=self.device)
+            flips_full = last_label
+        else:
+            # Keep only labels at chunk boundaries (i.e., end of each possible chunk)
+            flips_full = label_data[:, self.dt - 1:]  # shape: [B, g], where g = t - dt + 2
+            flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)
+            last_label = flips_full[:, -1:]
 
         # Extract graph structure and labels for non-empty chunks
         node_features, batch_labels, chunk_labels = self.get_node_features(syndromes, sampler_idx)
@@ -396,8 +398,12 @@ class Dataset:
         # Extract graph edges and attributes
         edge_index, edge_attr = self.get_edges(node_features, labels)
 
-        # align labels with chunk indices: 
-        aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips_full)
+        # Align labels with chunk indices
+        if self.label_mode != "last":
+            aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips_full)
+        else:
+            aligned_flips = torch.zeros(self.batch_size, 1, device=self.device)
+            lengths = torch.ones(self.batch_size, dtype=torch.long, device=self.device)
 
         # Move everything to the appropriate device
         node_features = node_features.to(self.device)
@@ -408,13 +414,13 @@ class Dataset:
         lengths = lengths.to(self.device)
 
         return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full
-    
+
     def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
         """
         Align labels from full chunk structure to compact GRU outputs.
 
         Args:
-            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx)
+            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx).
                                 Must be sorted by batch_idx (ascending).
             flips_full (Tensor): shape [B, g], full labels for all possible chunks.
 
@@ -428,9 +434,8 @@ class Dataset:
             then aligned_flips = [[a, b, c], [d, e, 0]]
             and lengths = [3, 2]
         """
-        
         B = self.batch_size
-        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch element 
+        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch element
         max_len = lengths.max().item()
 
         batch_idxs = label_map[:, 0].long()   # [n_valid]
@@ -454,9 +459,8 @@ class Dataset:
         # Allocate and fill aligned label tensor
         aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
         aligned_flips[batch_idxs, rel_pos] = values
-        
-        return aligned_flips, lengths
 
+        return aligned_flips, lengths
 
     def plot_graph(self, node_features, edge_index, labels, graph_idx):
         node_features = node_features.cpu().numpy()
@@ -477,28 +481,15 @@ class Dataset:
         ax.set_aspect('equal', adjustable='box')
         plt.gca().invert_yaxis()
 
-        # Plotting nodes.
         c = ["red" if np.round(feature[3]) == 0 else "green" for feature in features]
         ax.scatter(*features.T[:3], c=c)
-        
-        # Plotting edges.
+
         edge_coordinates = node_features[edges].T[:3]
         plt.plot(*edge_coordinates, c="blue", alpha=0.3)
-       
-        # Plotting stabilizers.
+
         x_stabs = np.nonzero(self.syndrome_mask == 1)
         z_stabs = np.nonzero(self.syndrome_mask == 3)
         ax.scatter(x_stabs[1], x_stabs[0], min_t, c="red",  alpha=0.3, s=50, label="X stabilizers")
         ax.scatter(z_stabs[1], z_stabs[0], min_t, c="green", alpha=0.3, s=50, label="Z stabilizers")
         plt.legend()
         plt.show()
-        
-if __name__ == "__main__":
-    args = Args(error_rates=[0.002], t=[99], sliding=True, dt=8)
-    dataset = Dataset(args)
-    t0 = time.perf_counter()
-    node_features, edge_index, labels, label_map, edge_attr, flips = dataset.generate_batch()
-    for i in tqdm(range(10)):
-        dataset.plot_graph(node_features, edge_index, labels, i)
-    print(f"{time.perf_counter() - t0:.3f} seconds")
-

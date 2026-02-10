@@ -101,9 +101,10 @@ def get_google_decoder_results(base_dir: Path, max_patches: int = 3, skip_rounds
 
 
 def parse_pij_log(log_path: str):
-    """Parse the p_ij model log file."""
+    """Parse the p_ij model log file. Returns (real_results, sim_results)."""
     import re
-    results = []
+    real_results = []
+    sim_results = []
 
     with open(log_path, 'r') as f:
         lines = f.readlines()
@@ -118,16 +119,34 @@ def parse_pij_log(log_path: str):
             current_r = int(match_proc.group(2))
             continue
 
+        # New format: "Real data LER: X.XXXX, Simulated LER: Y.YYYY"
+        match_both = re.search(r'Real data LER: ([\d.]+), Simulated LER: ([\d.]+)', line)
+        if match_both and current_d is not None:
+            ler_real = float(match_both.group(1))
+            ler_sim = float(match_both.group(2))
+            real_results.append({
+                'distance': current_d,
+                'rounds': current_r,
+                'logical_error_rate': ler_real
+            })
+            sim_results.append({
+                'distance': current_d,
+                'rounds': current_r,
+                'logical_error_rate': ler_sim
+            })
+            continue
+
+        # Old format: "Logical error rate: X.XXXX"
         match_result = re.search(r'Logical error rate: ([\d.]+)', line)
         if match_result and current_d is not None:
             ler = float(match_result.group(1))
-            results.append({
+            sim_results.append({
                 'distance': current_d,
                 'rounds': current_r,
                 'logical_error_rate': ler
             })
 
-    return results
+    return real_results, sim_results
 
 
 def fit_error_per_cycle(rounds: np.ndarray, p_logical: np.ndarray):
@@ -154,9 +173,10 @@ def main():
     print("Reading Google decoder results...", flush=True)
     google_results = get_google_decoder_results(base_dir, max_patches=3, skip_rounds=True)
 
-    # Get p_ij model results from log
+    # Get p_ij model results from log (both real and simulated)
     print("\nReading p_ij model results...", flush=True)
-    pij_results = parse_pij_log("replicate_fig1c.log")
+    pij_real_results, pij_sim_results = parse_pij_log("replicate_fig1c.log")
+    print(f"  Found {len(pij_real_results)} real results, {len(pij_sim_results)} simulated results", flush=True)
 
     # Average results by (d, r) with binomial error bars
     def average_results(results, default_n=50000):
@@ -180,7 +200,8 @@ def main():
         return averaged
 
     google_avg = average_results(google_results)
-    pij_avg = average_results(pij_results, default_n=50000)
+    pij_real_avg = average_results(pij_real_results, default_n=50000)
+    pij_sim_avg = average_results(pij_sim_results, default_n=50000)
 
     # Organize by distance
     def organize_by_d(averaged):
@@ -190,19 +211,21 @@ def main():
         return by_d
 
     google_by_d = organize_by_d(google_avg)
-    pij_by_d = organize_by_d(pij_avg)
+    pij_real_by_d = organize_by_d(pij_real_avg)
+    pij_sim_by_d = organize_by_d(pij_sim_avg)
 
     # =========================================================================
-    # Plot 1: P_L vs rounds comparison
+    # Plot 1: P_L vs rounds comparison (all three: Google RL, p_ij real, p_ij sim)
     # =========================================================================
-    fig1, ax1 = plt.subplots(figsize=(4, 3))
+    fig1, ax1 = plt.subplots(figsize=(4.5, 3.5))
 
     dist_colors = {3: "#66c2a5", 5: "#fc8d62", 7: "#8da0cb"}
+    all_distances = sorted(set(google_by_d.keys()) | set(pij_real_by_d.keys()) | set(pij_sim_by_d.keys()))
 
-    for d in sorted(set(google_by_d.keys()) | set(pij_by_d.keys())):
+    for d in all_distances:
         color = dist_colors.get(d, "gray")
 
-        # Google decoder (solid line)
+        # Google decoder (solid line, circles)
         if d in google_by_d:
             rounds_dict = google_by_d[d]
             rounds = np.array(sorted(rounds_dict.keys()))
@@ -212,19 +235,29 @@ def main():
                         marker='o', color=color, linestyle='-',
                         label=f"d={d} Google RL", markersize=4, linewidth=1, capsize=2, alpha=1)
 
-        # p_ij model (dashed line)
-        if d in pij_by_d:
-            rounds_dict = pij_by_d[d]
+        # p_ij model - real data (dashed line, squares)
+        if d in pij_real_by_d:
+            rounds_dict = pij_real_by_d[d]
             rounds = np.array(sorted(rounds_dict.keys()))
             p_logical = np.array([rounds_dict[r]["mean"] for r in rounds])
             p_std = np.array([rounds_dict[r]["std"] for r in rounds])
             ax1.errorbar(rounds, p_logical, yerr=p_std,
                         marker='s', color=color, linestyle='--',
-                        label=f"d={d} $p_{{ij}}$ model", markersize=4, linewidth=1, capsize=2, alpha=1)
+                        label=f"d={d} $p_{{ij}}$ (real)", markersize=4, linewidth=1, capsize=2, alpha=1)
+
+        # p_ij model - simulated (dotted line, triangles)
+        if d in pij_sim_by_d:
+            rounds_dict = pij_sim_by_d[d]
+            rounds = np.array(sorted(rounds_dict.keys()))
+            p_logical = np.array([rounds_dict[r]["mean"] for r in rounds])
+            p_std = np.array([rounds_dict[r]["std"] for r in rounds])
+            ax1.errorbar(rounds, p_logical, yerr=p_std,
+                        marker='^', color=color, linestyle=':',
+                        label=f"d={d} $p_{{ij}}$ (sim)", markersize=4, linewidth=1, capsize=2, alpha=1)
 
     ax1.set_xlabel("Number of rounds")
     ax1.set_ylabel(r"Logical error rate $P_L$")
-    ax1.legend(fontsize=6, ncol=2, loc='lower right')
+    ax1.legend(fontsize=5, ncol=3, loc='lower right')
     ax1.set_ylim(0, 0.55)
 
     plt.tight_layout()
@@ -238,9 +271,10 @@ def main():
     print("\n=== Error per cycle comparison ===", flush=True)
 
     eps_google = {}
-    eps_pij = {}
+    eps_pij_real = {}
+    eps_pij_sim = {}
 
-    for d in sorted(set(google_by_d.keys()) | set(pij_by_d.keys())):
+    for d in all_distances:
         if d in google_by_d:
             rounds_dict = google_by_d[d]
             rounds = np.array(sorted(rounds_dict.keys()))
@@ -248,39 +282,53 @@ def main():
             eps, _ = fit_error_per_cycle(rounds, p_logical)
             eps_google[d] = eps
 
-        if d in pij_by_d:
-            rounds_dict = pij_by_d[d]
+        if d in pij_real_by_d:
+            rounds_dict = pij_real_by_d[d]
             rounds = np.array(sorted(rounds_dict.keys()))
             p_logical = np.array([rounds_dict[r]["mean"] for r in rounds])
             eps, _ = fit_error_per_cycle(rounds, p_logical)
-            eps_pij[d] = eps
+            eps_pij_real[d] = eps
 
-    print(f"\n{'d':<5} {'Google RL':<12} {'p_ij model':<12} {'Ratio':<10}")
-    print("-" * 40)
-    for d in sorted(set(eps_google.keys()) | set(eps_pij.keys())):
+        if d in pij_sim_by_d:
+            rounds_dict = pij_sim_by_d[d]
+            rounds = np.array(sorted(rounds_dict.keys()))
+            p_logical = np.array([rounds_dict[r]["mean"] for r in rounds])
+            eps, _ = fit_error_per_cycle(rounds, p_logical)
+            eps_pij_sim[d] = eps
+
+    print(f"\n{'d':<5} {'Google RL':<12} {'p_ij real':<12} {'p_ij sim':<12} {'Ratio(real)':<12}")
+    print("-" * 55)
+    for d in all_distances:
         g = eps_google.get(d, np.nan)
-        p = eps_pij.get(d, np.nan)
-        ratio = p / g if g > 0 else np.nan
-        print(f"{d:<5} {g:<12.6f} {p:<12.6f} {ratio:<10.2f}")
+        r = eps_pij_real.get(d, np.nan)
+        s = eps_pij_sim.get(d, np.nan)
+        ratio = r / g if g > 0 else np.nan
+        print(f"{d:<5} {g:<12.6f} {r:<12.6f} {s:<12.6f} {ratio:<12.2f}")
 
     # =========================================================================
     # Plot 2: eps_L vs distance comparison
     # =========================================================================
     fig2, ax2 = plt.subplots(figsize=(3, 2.5))
 
-    distances = np.array(sorted(set(eps_google.keys()) | set(eps_pij.keys())))
+    distances = np.array(all_distances)
 
     # Google decoder
     eps_g_vals = np.array([eps_google.get(d, np.nan) for d in distances])
     valid_g = ~np.isnan(eps_g_vals)
     ax2.semilogy(distances[valid_g], eps_g_vals[valid_g], 'o-',
-                 color='#66c2a5', markersize=6, linewidth=1.5, label='Google RL decoder', alpha=1)
+                 color='#66c2a5', markersize=6, linewidth=1.5, label='Google RL', alpha=1)
 
-    # p_ij model
-    eps_p_vals = np.array([eps_pij.get(d, np.nan) for d in distances])
-    valid_p = ~np.isnan(eps_p_vals)
-    ax2.semilogy(distances[valid_p], eps_p_vals[valid_p], 's--',
-                 color='#fc8d62', markersize=6, linewidth=1.5, label='$p_{ij}$ model', alpha=1)
+    # p_ij model (real)
+    eps_r_vals = np.array([eps_pij_real.get(d, np.nan) for d in distances])
+    valid_r = ~np.isnan(eps_r_vals)
+    ax2.semilogy(distances[valid_r], eps_r_vals[valid_r], 's--',
+                 color='#fc8d62', markersize=6, linewidth=1.5, label='$p_{ij}$ (real)', alpha=1)
+
+    # p_ij model (sim)
+    eps_s_vals = np.array([eps_pij_sim.get(d, np.nan) for d in distances])
+    valid_s = ~np.isnan(eps_s_vals)
+    ax2.semilogy(distances[valid_s], eps_s_vals[valid_s], '^:',
+                 color='#8da0cb', markersize=6, linewidth=1.5, label='$p_{ij}$ (sim)', alpha=1)
 
     ax2.set_xlabel("Code distance $d$")
     ax2.set_ylabel(r"Error per cycle $\epsilon_L$")
@@ -295,12 +343,13 @@ def main():
     # Save comparison data
     with open(f"{output_base}_data.csv", "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["distance", "eps_google_rl", "eps_pij_model", "ratio"])
+        writer.writerow(["distance", "eps_google_rl", "eps_pij_real", "eps_pij_sim", "ratio_real"])
         for d in distances:
             g = eps_google.get(d, np.nan)
-            p = eps_pij.get(d, np.nan)
-            ratio = p / g if g > 0 else np.nan
-            writer.writerow([d, g, p, ratio])
+            r = eps_pij_real.get(d, np.nan)
+            s = eps_pij_sim.get(d, np.nan)
+            ratio = r / g if g > 0 else np.nan
+            writer.writerow([d, g, r, s, ratio])
 
     print(f"\nData saved to {output_base}_data.csv", flush=True)
     print("\nDone!", flush=True)

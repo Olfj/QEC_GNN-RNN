@@ -32,8 +32,8 @@ if __name__ == "__main__":
         error_rate=p,
         t=t,
         dt=dt,
-        sliding=True,
-        train_all_times = False,
+
+        label_mode = "last",
         batch_size=args_cli.batch_size,
         n_batches=args_cli.n_batches,
         n_epochs=args_cli.n_epochs,

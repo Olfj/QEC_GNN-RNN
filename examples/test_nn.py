@@ -25,7 +25,7 @@ if __name__ == "__main__":
         error_rate=args_cli.p,
         t=args_cli.t,
         dt=args_cli.dt,
-        sliding=True,
+
         batch_size=args_cli.batch_size,
         embedding_features=[3, 32, 64, 128, 256, 512],
         hidden_size=512,
@@ -46,7 +46,7 @@ if __name__ == "__main__":
             error_rate=args_cli.p,
             t=t,
             dt=args_cli.dt,
-            sliding=True,
+
             batch_size=args_cli.batch_size,
             embedding_features=[3, 32, 64, 128, 256, 512],
             hidden_size=512,

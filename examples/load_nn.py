@@ -14,7 +14,7 @@ if __name__ == "__main__":
         error_rates=[0.001],
         t=[99],
         dt=5,
-        sliding=True,
+
         batch_size=2048,
         embedding_features=[5, 32, 64, 128, 256],
         hidden_size=128,
@@ -33,7 +33,7 @@ if __name__ == "__main__":
         error_rates=[0.001],
         t=[99],
         dt=2,
-        sliding=True,
+
         batch_size=2048,
         embedding_features=[5, 32, 64, 128, 256],
         hidden_size=128,
@@ -52,7 +52,7 @@ if __name__ == "__main__":
         error_rates=[0.001],
         t=[99],
         dt=2,
-        sliding=True,
+
         batch_size=2048,
         embedding_features=[5, 32, 64, 128, 256, 512],
         hidden_size=256,

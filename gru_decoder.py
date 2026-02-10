@@ -110,7 +110,7 @@ class GRUDecoder(nn.Module):
                 #   g_actual = maximum number of non-empty chunks in batch
                 # (can vary between batches, <= t - dt + 2)
                 out, final_prediction = self.forward(x, edge_index, edge_attr, batch_labels, label_map)
-                if self.args.train_all_times:
+                if self.args.label_mode != "last":
                     # Create a boolean mask of shape [B, g_actual] indicating valid chunk positions
                     # For each batch element b, mask[b, i] = True if i < lengths[b]
                     # lengths[b] is the number of non-empty chunks for batch element b
@@ -119,10 +119,10 @@ class GRUDecoder(nn.Module):
                     # Compute binary cross-entropy loss for each element without reduction
                     # loss_raw has shape [B, g_actual], matching the shape of out and aligned_flips
                     loss_raw = nn.functional.binary_cross_entropy(out, aligned_flips, reduction='none')
-                    # make a weight tensor: all 1's except last element is 50
-                    weights = torch.ones_like(loss_raw)
-                    weights[:, -1] = self.args.t
-                    loss_raw = loss_raw * weights
+                    if self.args.weight_last:
+                        weights = torch.ones_like(loss_raw)
+                        weights[torch.arange(out.size(0), device=out.device), lengths - 1] = self.args.t
+                        loss_raw = loss_raw * weights
                     # Apply the mask to zero out the loss from padded (non-existent) chunks
                     # Then compute the mean loss over all valid elements
                     loss = (loss_raw * mask).sum() / mask.sum()
@@ -210,18 +210,28 @@ class GRUDecoder(nn.Module):
             t2 = time.perf_counter()
             # print(torch.sum(out, dim=0))
             label_map = label_map.int()
+            B = self.args.batch_size
             g_max = self.args.t - self.args.dt + 2
-            # Build index matrix from label_map
-            idx = torch.full((self.args.batch_size, g_max), -1, dtype=torch.long)
-            idx[label_map[:,0], label_map[:,1]] = torch.arange(label_map.size(0))
 
-            # Forward-fill indices
+            # Build index matrix: idx[b, c] = global graph index for (batch b, chunk c)
+            idx = torch.full((B, g_max), -1, dtype=torch.long, device=out.device)
+            idx[label_map[:, 0], label_map[:, 1]] = torch.arange(
+                label_map.size(0), device=out.device
+            )
             mask = idx != -1
-            ffill = torch.where(mask, idx, torch.zeros_like(idx))
-            ffill = ffill.cummax(dim=1).values    # forward fill each row
 
-            # Gather values
-            vals = torch.cat([out[b, :sum(mask[b]).item()] for b in range(self.args.batch_size)])
+            # Flatten valid GRU outputs into a single vector (ordered by batch, then chunk)
+            counts_per_batch = mask.sum(dim=1)
+            vals = torch.cat([out[b, :counts_per_batch[b]] for b in range(B)])
+
+            # Per-batch offset into vals so empty positions default to own batch's first graph
+            batch_offsets = torch.zeros(B, dtype=torch.long, device=out.device)
+            batch_offsets[1:] = counts_per_batch[:-1].cumsum(0)
+
+            # Forward-fill: empty positions get the preceding valid index within the same batch
+            ffill = torch.where(mask, idx, batch_offsets[:, None].expand_as(idx))
+            ffill = ffill.cummax(dim=1).values
+
             out_per_chunk = vals[ffill]
 
             correct_per_chunk_and_shot = (torch.round(out_per_chunk) == flips_full)
