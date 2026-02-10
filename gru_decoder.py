@@ -76,7 +76,7 @@ class GRUDecoder(nn.Module):
         best_model = self.state_dict()
 
         if self.args.log_wandb:
-            wandb.init(project="GNN-RNN-google", name = save, config = self.args)
+            wandb.init(project=self.args.wandb_project, name=save, config=self.args)
 
         if local_log:
             logger.on_training_begin(self.args)

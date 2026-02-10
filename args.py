@@ -33,3 +33,4 @@ class Args:
     hidden_size: int = 128 
     n_gru_layers: int = 4
     log_wandb: bool = False
+    wandb_project: str = "GNN-RNN-google"
