@@ -22,16 +22,19 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import scienceplots
-plt.style.use('science')
+try:
+    plt.style.use('science')
+except Exception:
+    plt.style.use(['science', 'no-latex'])
 import matplotlib.colors as colors
 plt.rcParams['axes.prop_cycle'] = plt.cycler(color=[
     "#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3",
     "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3"])
+import pymatching
 from collections import OrderedDict
 
 from gru_decoder import GRUDecoder
 from data import Dataset, Args
-from mwmp import test_mwpm
 
 
 def load_model(model_path, args):
@@ -53,7 +56,7 @@ def main():
     parser.add_argument("--dt", type=int, default=2, help="Sliding window size")
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--shots", type=int, default=1_000_000,
-                        help="Total shots per round count (n_iter = shots // batch_size)")
+                        help="Max shots per round (adaptive sampling stops earlier if rel_std < 1%%)")
     parser.add_argument("--rounds", type=int, nargs="+",
                         default=[5, 10, 20, 50, 100, 200, 500, 1000])
     parser.add_argument("--model_last", type=str, default=None,
@@ -97,10 +100,10 @@ def main():
         print("No NN models provided — evaluating MWPM only.")
 
     rounds_list = sorted(cli.rounds)
-    n_iter = max(1, cli.shots // cli.batch_size)
-    total_shots = n_iter * cli.batch_size
-    print(f"d={cli.d}, p={cli.p}, dt={cli.dt}, "
-          f"batch_size={cli.batch_size}, n_iter={n_iter} ({total_shots} shots/round)")
+    max_shots = cli.shots
+    target_rel_std = 0.01
+    print(f"d={cli.d}, p={cli.p}, dt={cli.dt}, batch_size={cli.batch_size}")
+    print(f"Adaptive sampling: target rel_std={target_rel_std}, max_shots={max_shots}")
     print(f"Rounds: {rounds_list}\n")
 
     # Results: method -> {t: (P_L, std)}
@@ -121,23 +124,39 @@ def main():
         )
         dataset = Dataset(dataset_args)
 
-        # Evaluate NN models
+        # --- Adaptive MWPM: sample until rel_std < 1%, capped at max_shots ---
+        dem = dataset.circuits[0].detector_error_model(decompose_errors=True)
+        matcher = pymatching.Matching.from_detector_error_model(dem)
+
+        total_correct = 0
+        total_shots = 0
+        while total_shots < max_shots:
+            det_events, flips = dataset.sample_syndromes(0)
+            preds = matcher.decode_batch(det_events)
+            total_correct += int(np.sum(preds == flips))
+            total_shots += cli.batch_size
+            p_l = 1 - total_correct / total_shots
+            if p_l > 0:
+                rel_std = np.sqrt((1 - p_l) / (p_l * total_shots))
+                if rel_std < target_rel_std:
+                    break
+
+        std_mwpm = np.sqrt(p_l * (1 - p_l) / total_shots)
+        print(f"  {'MWPM':15s}  P_L={p_l:.6f} +/- {std_mwpm:.6f} ({total_shots} shots)")
+        results["MWPM"][t] = (p_l, std_mwpm)
+
+        # --- Evaluate NN models with the same shot count ---
+        n_iter = max(1, total_shots // cli.batch_size)
         for name, decoder in models.items():
             with torch.no_grad():
                 acc, std = decoder.test_model(dataset, n_iter=n_iter, verbose=False)
             acc = float(acc)
             std = float(std)
-            p_l = 1 - acc
-            print(f"  {name:15s}  acc={acc:.6f}  P_L={p_l:.6f} +/- {std:.6f}")
-            results[name][t] = (p_l, std)
+            p_l_nn = 1 - acc
+            print(f"  {name:15s}  P_L={p_l_nn:.6f} +/- {std:.6f} ({n_iter * cli.batch_size} shots)")
+            results[name][t] = (p_l_nn, std)
 
-        # Evaluate MWPM
-        acc_mwpm, std_mwpm = test_mwpm(dataset, n_iter=n_iter, verbose=False)
-        acc_mwpm = float(acc_mwpm)
-        std_mwpm = float(std_mwpm)
-        p_l_mwpm = 1 - acc_mwpm
-        print(f"  {'MWPM':15s}  acc={acc_mwpm:.6f}  P_L={p_l_mwpm:.6f} +/- {std_mwpm:.6f}")
-        results["MWPM"][t] = (p_l_mwpm, std_mwpm)
+        del matcher
         print()
 
     # --- Save CSV ---
@@ -182,15 +201,13 @@ def main():
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Rounds")
-    ax.set_ylabel("Logical Error Rate $P_L$")
+    ax.set_ylabel(r"Logical Error Rate $P_L$")
     ax.set_title(f"d={cli.d}, p={cli.p}")
     ax.legend()
     fig.tight_layout()
 
     fig.savefig(f"{out_prefix}.pdf")
     print(f"Saved figure to {out_prefix}.pdf")
-
-    plt.show()
 
 
 if __name__ == "__main__":
