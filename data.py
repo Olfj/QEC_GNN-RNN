@@ -155,6 +155,11 @@ class Dataset:
             self.detector_coordinates.append(detector_coordinates.astype(np.int64))
             self._sampler_t.append(int(detector_coordinates[:, -1].max()))
 
+        # Estimate acceptance rate (fraction of shots with ≥1 detection event)
+        pilot = self.samplers[0].sample(shots=min(10000, self.batch_size * 3))
+        n_accept = np.count_nonzero(np.any(pilot[0], axis=1))
+        self._accept_rate = max(n_accept / pilot[0].shape[0], 0.05)
+
         # Mode-specific initialization
         if self.label_mode == "error_chain":
             self._init_error_chain_data()
@@ -211,27 +216,37 @@ class Dataset:
         """Sample from DEM, return only final logical label."""
         sampler = self.samplers[sampler_idx]
         detection_events_list, observable_flips_list = [], []
+        n_draw = int(self.batch_size / self._accept_rate * 1.1) + 1
         while len(detection_events_list) < self.batch_size:
-            detection_events, observable_flips, _ = sampler.sample(shots=self.batch_size)
-            shots_w_flips = np.sum(detection_events, axis=1) != 0
-            detection_events_list.extend(detection_events[shots_w_flips, :])
-            observable_flips_list.extend(observable_flips[shots_w_flips, :])
+            detection_events, observable_flips, _ = sampler.sample(shots=n_draw)
+            mask = np.any(detection_events, axis=1)
+            detection_events_list.extend(detection_events[mask])
+            observable_flips_list.extend(observable_flips[mask])
+            if len(detection_events_list) < self.batch_size:
+                remaining = self.batch_size - len(detection_events_list)
+                rate = max(mask.sum() / n_draw, 0.05)
+                n_draw = int(remaining / rate * 1.2) + 1
         detection_array = np.array(detection_events_list[:self.batch_size])
         flips_array = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
-        return detection_array.astype(bool), flips_array[:, :1]  # shape [B, 1]
+        return detection_array.astype(bool), flips_array[:, :1]
 
     def _sample_mpp(self, sampler_idx: int):
         """Sample from MPP circuit, extract intermediate logical labels from obs_flips."""
         sampler = self.mpp_samplers[sampler_idx]
         num_det = self.mpp_circuits[sampler_idx].num_detectors
         detection_events_list, observable_flips_list = [], []
+        n_draw = int(self.batch_size / self._accept_rate * 1.1) + 1
         while len(detection_events_list) < self.batch_size:
-            result = sampler.sample(shots=self.batch_size, append_observables=True)
+            result = sampler.sample(shots=n_draw, append_observables=True)
             detection_events = result[:, :num_det]
             observable_flips = result[:, num_det:]
-            shots_w_flips = np.sum(detection_events, axis=1) != 0
-            detection_events_list.extend(detection_events[shots_w_flips, :])
-            observable_flips_list.extend(observable_flips[shots_w_flips, :])
+            mask = np.any(detection_events, axis=1)
+            detection_events_list.extend(detection_events[mask])
+            observable_flips_list.extend(observable_flips[mask])
+            if len(detection_events_list) < self.batch_size:
+                remaining = self.batch_size - len(detection_events_list)
+                rate = max(mask.sum() / n_draw, 0.05)
+                n_draw = int(remaining / rate * 1.2) + 1
         detection_array = np.array(detection_events_list[:self.batch_size])
         obs_flips = np.array(observable_flips_list[:self.batch_size], dtype=np.int32)
         # obs_flips[:, 1:] = intermediate logicals (noiseless MPP after each MR round, times 0..t-1)
@@ -369,9 +384,8 @@ class Dataset:
 
         Returns:
             node_features, edge_index, labels, label_map, edge_attr,
-            aligned_flips, lengths, last_label, flips_full
+            last_label, flips_full
         """
-        # Sample syndromes and logical labels
         sampler_idx = np.random.choice(len(self.samplers))
         syndromes, label_data = self.sample_syndromes(sampler_idx)
 
@@ -379,88 +393,28 @@ class Dataset:
             last_label = torch.from_numpy(label_data).to(dtype=torch.float32, device=self.device)
             flips_full = last_label
         else:
-            # Keep only labels at chunk boundaries (i.e., end of each possible chunk)
-            flips_full = label_data[:, self.dt - 1:]  # shape: [B, g], where g = t - dt + 2
+            flips_full = label_data[:, self.dt - 1:]  # shape: [B, g_max]
             flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)
             last_label = flips_full[:, -1:]
 
-        # Extract graph structure and labels for non-empty chunks
         node_features, batch_labels, chunk_labels = self.get_node_features(syndromes, sampler_idx)
         node_features = torch.from_numpy(node_features)
 
-        # Map each unique (batch, chunk) pair to a unique graph index
         label_map = np.array(list(zip(batch_labels, chunk_labels)))
         label_map, counts = np.unique(label_map, axis=0, return_counts=True)
         labels = np.repeat(np.arange(counts.shape[0]), counts).astype(np.int64)
         label_map = torch.from_numpy(label_map)
         labels = torch.from_numpy(labels)
 
-        # Extract graph edges and attributes
         edge_index, edge_attr = self.get_edges(node_features, labels)
 
-        # Align labels with chunk indices
-        if self.label_mode != "last":
-            aligned_flips, lengths = self.align_labels_to_outputs(label_map, flips_full)
-        else:
-            aligned_flips = torch.zeros(self.batch_size, 1, device=self.device)
-            lengths = torch.ones(self.batch_size, dtype=torch.long, device=self.device)
-
-        # Move everything to the appropriate device
         node_features = node_features.to(self.device)
         labels = labels.to(self.device)
-        label_map = label_map.to(dtype=torch.float32, device=self.device)
+        label_map = label_map.to(dtype=torch.long, device=self.device)
         edge_index = edge_index.to(self.device)
         edge_attr = edge_attr.to(self.device)
-        lengths = lengths.to(self.device)
 
-        return node_features, edge_index, labels, label_map, edge_attr, aligned_flips, lengths, last_label, flips_full
-
-    def align_labels_to_outputs(self, label_map: torch.Tensor, flips_full: torch.Tensor):
-        """
-        Align labels from full chunk structure to compact GRU outputs.
-
-        Args:
-            label_map (Tensor): shape [n_valid_chunks, 2], each row is (batch_idx, chunk_idx).
-                                Must be sorted by batch_idx (ascending).
-            flips_full (Tensor): shape [B, g], full labels for all possible chunks.
-
-        Returns:
-            aligned_flips (Tensor): shape [B, L], aligned with GRU output (non-empty chunks only).
-            lengths (Tensor): shape [B], number of real chunks per batch element.
-
-        Example:
-            If flips_full = [[a, -, b, c], [d, e, -, -]]
-            and label_map = [[0,0], [0,2], [0,3], [1,0], [1,1]]
-            then aligned_flips = [[a, b, c], [d, e, 0]]
-            and lengths = [3, 2]
-        """
-        B = self.batch_size
-        lengths = torch.bincount(label_map[:, 0].long(), minlength=B)  # number of chunks per batch element
-        max_len = lengths.max().item()
-
-        batch_idxs = label_map[:, 0].long()   # [n_valid]
-        chunk_idxs = label_map[:, 1].long()   # [n_valid]
-
-        # Compute correct relative positions (resets counter per batch)
-        rel_pos = torch.zeros_like(batch_idxs)
-        current_batch = batch_idxs[0].item()
-        counter = 0
-        for i in range(batch_idxs.size(0)):
-            b = batch_idxs[i].item()
-            if b != current_batch:
-                current_batch = b
-                counter = 0
-            rel_pos[i] = counter
-            counter += 1
-
-        # Gather the labels to fill in
-        values = flips_full[batch_idxs, chunk_idxs]
-
-        # Allocate and fill aligned label tensor
-        aligned_flips = torch.zeros(B, max_len, device=flips_full.device)
-        aligned_flips[batch_idxs, rel_pos] = values
-
-        return aligned_flips, lengths
+        return node_features, edge_index, labels, label_map, edge_attr, last_label, flips_full
 
     def plot_graph(self, node_features, edge_index, labels, graph_idx):
         node_features = node_features.cpu().numpy()

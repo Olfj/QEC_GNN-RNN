@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence
 from torch_geometric.nn import GraphConv
 import torch
 import logging
@@ -110,35 +109,26 @@ def make_surface_code_with_logical_z_tracking(distance: int, rounds: int, error_
     return new_circuit
 
 
-def group(x, label_map):
+def group(x, label_map, B, g_max, empty_embedding):
         """
-        Groups graphs according to which batch element they belong to. 
+        Places graph embeddings into a fixed-size [B, g_max, embed_dim] tensor.
+
+        Non-empty chunks get their GNN embedding; empty chunks get a learned
+        empty_embedding vector. The GRU sees every time step including empty slots.
 
         Args:
-        x: tensor of shape [n_graphs, embedding size]. 
-        label_map: tensor of shape [n_graphs]. 
-    
-        Returns: 
-        A tensor of shape [batch size, g, embedding size] where
-            g represents the number of graphs belonging to a batch element. 
-            If t = 24 and dt = 5, then g = 5, i.e. g = t - dt + 2.
-            Batch elements may contain less than t - dt + 2 graphs. 
-            This happens when there are no detection events in a chunk. 
-            For instance, if t = 24 and dt = 5, and no detection
-            events occur between timesteps 0 and 4, there would
-            be no graph for this chunk. Therefore, any "missing" graphs are 
-            replaced with zeros, such that the dimensions work out properly. 
-            The zero padding happens at the end of the sequence, e.g. if 
-            g = 5 and some batch element consists only of graphs 2 and 3,
-            the result would look like [2, 3, 0, 0, 0], where 2 and 3 
-            represent the graph embeddings for graphs 2 and 3, and the zeros
-            represent zero-padding.  
-        """     
-        counts = torch.unique(label_map[:, 0], return_counts=True)[-1]
-        grouped = torch.split(x, list(counts))
-        padded = pad_sequence(grouped, batch_first=True)
-        # padded has shape [batch, t, embedding_features[-1]]
-        return pack_padded_sequence(padded, counts.cpu(), batch_first=True, enforce_sorted=False)
+            x: tensor [n_graphs, embed_dim].
+            label_map: long tensor [n_graphs, 2], each row (batch_idx, chunk_idx).
+            B: batch size.
+            g_max: number of chunks per sample (t - dt + 2).
+            empty_embedding: tensor [embed_dim], learned "no event" token.
+
+        Returns:
+            Tensor of shape [B, g_max, embed_dim].
+        """
+        out = empty_embedding.view(1, 1, -1).expand(B, g_max, -1).clone()
+        out[label_map[:, 0], label_map[:, 1]] = x
+        return out
 
 class GraphConvLayer(nn.Module):
     def __init__(self, in_features, out_features, act=nn.ReLU()):
