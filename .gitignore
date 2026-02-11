@@ -8,7 +8,6 @@ __pycache__/
 *.txt
 *.ipynb
 *.yaml
-*.sh
 *.out
 /wandb
 /logs

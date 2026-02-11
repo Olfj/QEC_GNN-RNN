@@ -83,6 +83,40 @@ class GRUDecoder(nn.Module):
         
         self.train()
         dataset = Dataset(self.args)
+
+        # Compute MWPM baseline accuracy once for wandb reference line.
+        # Adaptively samples until std/P_L < 1%, capped at max_shots.
+        mwpm_accuracy = None
+        if self.args.log_wandb:
+            import pymatching
+            mwpm_args = deepcopy(self.args)
+            mwpm_args.label_mode = "last"
+            mwpm_dataset = Dataset(mwpm_args)
+            dem = mwpm_dataset.circuits[0].detector_error_model(decompose_errors=True)
+            matcher = pymatching.Matching.from_detector_error_model(dem)
+
+            total_correct = 0
+            total_shots = 0
+            max_shots = 10_000_000
+            target_rel_std = 0.01
+            while total_shots < max_shots:
+                det_events, flips = mwpm_dataset.sample_syndromes(0)
+                preds = matcher.decode_batch(det_events)
+                total_correct += int(np.sum(preds == flips))
+                total_shots += mwpm_args.batch_size
+                p_l = 1 - total_correct / total_shots
+                if p_l > 0:
+                    rel_std = np.sqrt((1 - p_l) / (p_l * total_shots))
+                    if rel_std < target_rel_std:
+                        break
+
+            mwpm_accuracy = total_correct / total_shots
+            p_l = 1 - mwpm_accuracy
+            std = np.sqrt(p_l * (1 - p_l) / total_shots)
+            print(f"MWPM baseline: acc={mwpm_accuracy:.6f}, "
+                  f"P_L={p_l:.6f} +/- {std:.6f} ({total_shots} shots)")
+            del mwpm_dataset
+
         optim = torch.optim.Adam(self.parameters(), lr=self.args.lr)
         schedule = lambda epoch: max(0.95 ** epoch, self.args.min_lr / self.args.lr)
         scheduler = LambdaLR(optim, lr_lambda=schedule)
@@ -153,6 +187,7 @@ class GRUDecoder(nn.Module):
             }
 
             if self.args.log_wandb:
+                metrics["mwpm_accuracy"] = mwpm_accuracy
                 wandb.log(metrics)
             if local_log:
                 logger.on_epoch_end(logs=metrics)
