@@ -29,7 +29,7 @@ class Args:
     min_lr: float = 1e-4
 
     # Model
-    embedding_features: list = field(default_factory=lambda: [5, 32, 64, 128, 256])
+    embedding_features: list = field(default_factory=lambda: [3, 32, 64, 128, 256])
     hidden_size: int = 128 
     n_gru_layers: int = 4
     log_wandb: bool = False

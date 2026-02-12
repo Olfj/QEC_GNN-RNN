@@ -6,7 +6,6 @@ import time
 import matplotlib.pyplot as plt
 from enum import Enum
 from args import Args
-from torch_geometric.nn.pool import knn_graph
 
 
 def add_mpp_to_circuit(circuit: stim.Circuit, distance: int) -> stim.Circuit:
@@ -160,6 +159,9 @@ class Dataset:
         n_accept = np.count_nonzero(np.any(pilot[0], axis=1))
         self._accept_rate = max(n_accept / pilot[0].shape[0], 0.05)
 
+        # Precompute fully-connected edge weight matrix
+        self._precompute_edge_weights()
+
         # Mode-specific initialization
         if self.label_mode == "error_chain":
             self._init_error_chain_data()
@@ -195,6 +197,29 @@ class Dataset:
         """Build MPP circuits and compile their detector samplers."""
         self.mpp_circuits = [add_mpp_to_circuit(c, self.distance) for c in self.circuits]
         self.mpp_samplers = [c.compile_detector_sampler(seed=self.seed) for c in self.mpp_circuits]
+
+    def _precompute_edge_weights(self):
+        """Precompute fully-connected edge weight matrix for chunk-local positions."""
+        unique_xy = np.unique(self.detector_coordinates[0][:, :2], axis=0)
+        chunk_pos = np.array(
+            [(x, y, tl) for x, y in unique_xy for tl in range(self.dt)],
+            dtype=np.int64,
+        )
+        # Pairwise L-inf distance → inverse-square weights
+        diff = chunk_pos[:, None, :] - chunk_pos[None, :, :]
+        dist = np.abs(diff).max(axis=2).astype(np.float32)
+        with np.errstate(divide='ignore'):
+            self._edge_weights = np.where(dist > 0, 1.0 / dist**2, 0.0).astype(np.float32)
+
+        # Coordinate → position index lookup (3D array for O(1) vectorized access)
+        max_x = int(unique_xy[:, 0].max())
+        max_y = int(unique_xy[:, 1].max())
+        self._pos_idx = np.full((max_x + 1, max_y + 1, self.dt), -1, dtype=np.int64)
+        for i, (x, y, tl) in enumerate(chunk_pos):
+            self._pos_idx[x, y, tl] = i
+
+        # Cache for local pair indices by group size
+        self._local_pairs = {}
 
     def sample_syndromes(self, sampler_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -347,34 +372,74 @@ class Dataset:
         chunk_labels = np.concatenate(chunk_labels)
         return node_features, chunk_labels
 
-    def get_node_features(self, syndromes: np.ndarray, sampler_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_node_features(self, syndromes: np.ndarray, sampler_idx: int):
         """
         Converts detection event indices into physical node features (x, y, t)
         and assigns them to batch and chunk labels via a sliding window over time.
+
+        Returns float32 features, batch labels, chunk labels, and integer coords
+        (for edge weight lookup).
         """
         node_features = [self.detector_coordinates[sampler_idx][s] for s in syndromes]
 
         node_features, chunk_labels = self.get_sliding_window(node_features, self._sampler_t[sampler_idx])
 
         batch_labels = np.repeat(np.arange(self.batch_size), [len(i) for i in node_features])
-        node_features = np.vstack(node_features).astype(np.float32)
+        coords_int = np.vstack(node_features)  # uint64
+        node_features_float = coords_int.astype(np.float32)
 
-        return node_features, batch_labels, chunk_labels
+        return node_features_float, batch_labels, chunk_labels, coords_int
 
-    def get_edges(self, node_features: np.ndarray, labels) -> tuple[np.ndarray, np.ndarray]:
+    def _compute_fc_edges(self, coords_int, group_starts, group_sizes):
+        """Compute fully connected edges with precomputed weights.
+
+        For each group of nodes (same batch+chunk), creates all directed pairs
+        and looks up edge weights from the precomputed weight matrix.
         """
-        Returns edges between nodes. The edges are of shape [n_edges, 2].
+        edge_src_list = []
+        edge_tgt_list = []
+        edge_weight_list = []
 
-        Use ord=torch.inf for the supremum norm, ord=2 for euclidean norm.
-        """
-        # Compute edges.
-        edge_index = knn_graph(node_features, self.k, batch=labels)
+        unique_sizes, size_inverse = np.unique(group_sizes, return_inverse=True)
 
-        # Compute the distances between the nodes:
-        delta = node_features[edge_index[1]] - node_features[edge_index[0]]
-        edge_attr = torch.linalg.norm(delta, ord=self.norm, dim=1)
-        # Inverse square of the norm between two nodes.
-        edge_attr = 1 / edge_attr ** 2
+        for ui, s in enumerate(unique_sizes):
+            if s <= 1:
+                continue
+
+            # All groups with this size
+            starts = group_starts[size_inverse == ui]
+
+            # Local pair indices for this size (cached)
+            if s not in self._local_pairs:
+                src_local, tgt_local = np.where(~np.eye(s, dtype=bool))
+                self._local_pairs[s] = (src_local, tgt_local)
+            src_local, tgt_local = self._local_pairs[s]
+
+            # Global node indices: [n_groups, n_pairs_per_group] → flat
+            global_src = (starts[:, None] + src_local[None, :]).ravel()
+            global_tgt = (starts[:, None] + tgt_local[None, :]).ravel()
+
+            # Look up position indices from integer coordinates
+            src_coords = coords_int[global_src]
+            tgt_coords = coords_int[global_tgt]
+            pos_src = self._pos_idx[src_coords[:, 0], src_coords[:, 1], src_coords[:, 2]]
+            pos_tgt = self._pos_idx[tgt_coords[:, 0], tgt_coords[:, 1], tgt_coords[:, 2]]
+
+            weights = self._edge_weights[pos_src, pos_tgt]
+
+            edge_src_list.append(global_src)
+            edge_tgt_list.append(global_tgt)
+            edge_weight_list.append(weights)
+
+        if edge_src_list:
+            edge_src = np.concatenate(edge_src_list)
+            edge_tgt = np.concatenate(edge_tgt_list)
+            edge_weights = np.concatenate(edge_weight_list)
+            edge_index = torch.from_numpy(np.stack([edge_src, edge_tgt]).astype(np.int64))
+            edge_attr = torch.from_numpy(edge_weights)
+        else:
+            edge_index = torch.zeros((2, 0), dtype=torch.long)
+            edge_attr = torch.zeros(0, dtype=torch.float32)
 
         return edge_index, edge_attr
 
@@ -397,16 +462,24 @@ class Dataset:
             flips_full = torch.from_numpy(flips_full).to(dtype=torch.float32, device=self.device)
             last_label = flips_full[:, -1:]
 
-        node_features, batch_labels, chunk_labels = self.get_node_features(syndromes, sampler_idx)
+        node_features, batch_labels, chunk_labels, coords_int = self.get_node_features(syndromes, sampler_idx)
         node_features = torch.from_numpy(node_features)
 
-        label_map = np.array(list(zip(batch_labels, chunk_labels)))
-        label_map, counts = np.unique(label_map, axis=0, return_counts=True)
-        labels = np.repeat(np.arange(counts.shape[0]), counts).astype(np.int64)
+        # Fast label_map: exploit sorted (batch, chunk) ordering
+        g_max = self._sampler_t[sampler_idx] - self.dt + 2
+        combined = batch_labels.astype(np.int64) * g_max + chunk_labels.astype(np.int64)
+        change = np.empty(len(combined), dtype=bool)
+        change[0] = True
+        change[1:] = combined[1:] != combined[:-1]
+        group_starts = np.flatnonzero(change)
+        group_sizes = np.diff(np.append(group_starts, len(combined)))
+
+        label_map = np.column_stack([batch_labels[group_starts], chunk_labels[group_starts]])
+        labels = np.repeat(np.arange(len(group_starts), dtype=np.int64), group_sizes)
         label_map = torch.from_numpy(label_map)
         labels = torch.from_numpy(labels)
 
-        edge_index, edge_attr = self.get_edges(node_features, labels)
+        edge_index, edge_attr = self._compute_fc_edges(coords_int, group_starts, group_sizes)
 
         node_features = node_features.to(self.device)
         labels = labels.to(self.device)
