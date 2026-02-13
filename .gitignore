@@ -26,3 +26,4 @@ __pycache__/
 *.svg
 *.01
 *.yml
+*lprof
